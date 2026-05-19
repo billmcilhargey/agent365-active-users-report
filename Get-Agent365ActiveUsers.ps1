@@ -81,8 +81,21 @@ function Update-StepProgress {
     Write-Progress -Activity $Activity -Status $Status -PercentComplete $percent
 }
 
-"" | Set-Content -Path $script:LogFullPath -Encoding UTF8
-Write-Log -Message "Starting Agent 365 active users report run."
+# Always start with a fresh log file so each run is self-contained.
+if (Test-Path -LiteralPath $script:LogFullPath) {
+    try {
+        Remove-Item -LiteralPath $script:LogFullPath -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not remove existing log file '$script:LogFullPath': $($_.Exception.Message). Falling back to truncate."
+        '' | Set-Content -LiteralPath $script:LogFullPath -Encoding UTF8 -Force
+    }
+}
+
+Write-Log -Message ("=" * 72)
+Write-Log -Message "Agent 365 Active Users Report v$script:ScriptVersion"
+Write-Log -Message "Run started: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))"
+Write-Log -Message "Log file:    $script:LogFullPath"
+Write-Log -Message ("=" * 72)
 if ($VerboseLog) {
     Write-Log -Message 'Verbose logging is enabled.'
 }
@@ -412,16 +425,30 @@ function Get-CopilotSummaryMetrics {
         }
     }
 
-    # Final fallback: ask explicitly for CSV and parse it.
+    # Final fallback: ask explicitly for CSV. The Graph CSV response comes back
+    # as an octet-stream attachment that Invoke-MgGraphRequest will not return
+    # inline, so write it to a temp file and read it back.
+    $tmpCsv = $null
     try {
         $csvUri = "$base`?`$format=text/csv"
-        Write-VerboseLog -Message "Falling back to CSV: $csvUri"
-        $csvResp = Invoke-MgGraphRequest -Method GET -Uri $csvUri
-        $csvText = if ($csvResp -is [string]) { $csvResp } else { [string]$csvResp }
+        $tmpCsv = [System.IO.Path]::Combine(
+            [System.IO.Path]::GetTempPath(),
+            "copilot-summary-$([guid]::NewGuid()).csv"
+        )
+        Write-VerboseLog -Message "Falling back to CSV via temp file: $csvUri -> $tmpCsv"
+        Invoke-MgGraphRequest -Method GET -Uri $csvUri -OutputFilePath $tmpCsv | Out-Null
+        if (-not (Test-Path -LiteralPath $tmpCsv)) {
+            throw "Graph did not write any CSV output to '$tmpCsv'."
+        }
+        $csvText = Get-Content -LiteralPath $tmpCsv -Raw
         $parsed = ConvertFrom-CopilotSummaryCsv -CsvText $csvText -Period $Period
         if ($parsed) { return $parsed }
     } catch {
         throw "Failed to retrieve Copilot summary metrics from Graph. Last error: $($_.Exception.Message)"
+    } finally {
+        if ($tmpCsv -and (Test-Path -LiteralPath $tmpCsv)) {
+            Remove-Item -LiteralPath $tmpCsv -Force -ErrorAction SilentlyContinue
+        }
     }
 
     throw 'No data returned from getMicrosoft365CopilotUserCountSummary (no JSON or CSV variant succeeded).'
