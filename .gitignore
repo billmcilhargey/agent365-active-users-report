@@ -1,0 +1,13 @@
+# Logs and generated runtime artifacts
+*.log
+
+# Generated reports
+*.html
+
+# PowerShell temporary files and IDE noise
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
