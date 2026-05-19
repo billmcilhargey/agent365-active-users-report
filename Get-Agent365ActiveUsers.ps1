@@ -27,7 +27,9 @@ param(
 
     [switch]$NoProgress,
 
-    [switch]$VerboseLog
+    [switch]$VerboseLog,
+
+    [switch]$UseDeviceCode
 )
 
 Set-StrictMode -Version Latest
@@ -160,6 +162,119 @@ function Get-TenantContextInfo {
     return $info
 }
 
+function Test-CanLaunchBrowser {
+    [CmdletBinding()]
+    param()
+
+    # Explicit environment overrides
+    if ($env:AGENT365_FORCE_DEVICE_CODE -eq 'true') { return $false }
+    if ($env:AGENT365_FORCE_BROWSER     -eq 'true') { return $true }
+
+    # Non-interactive PowerShell host (e.g. CI / scheduled task)
+    try {
+        if (-not [Environment]::UserInteractive) { return $false }
+        $hostName = $Host.Name
+        if ($hostName -like '*Default Host*' -or $hostName -like '*ServerRemoteHost*') {
+            return $false
+        }
+    } catch {
+        return $false
+    }
+
+    # SSH session (no local browser)
+    if ($env:SSH_CLIENT -or $env:SSH_TTY -or $env:SSH_CONNECTION) { return $false }
+
+    # GitHub Codespaces / VS Code dev containers
+    if ($env:CODESPACES         -eq 'true') { return $false }
+    if ($env:CODESPACE_NAME)                 { return $false }
+    if ($env:REMOTE_CONTAINERS  -eq 'true') { return $false }
+    if ($env:DEVCONTAINER       -eq 'true') { return $false }
+
+    # Generic Linux container marker
+    if ($IsLinux -and (Test-Path '/.dockerenv')) { return $false }
+
+    # Linux without an X / Wayland display (no GUI)
+    if ($IsLinux -and -not $env:DISPLAY -and -not $env:WAYLAND_DISPLAY) { return $false }
+
+    return $true
+}
+
+function Connect-Agent365Graph {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Scopes,
+        [switch]$UseDeviceCode
+    )
+
+    $useDevice = $UseDeviceCode.IsPresent
+    if ($useDevice) {
+        Write-Log -Message 'Device code authentication requested for Microsoft Graph.'
+    } elseif (-not (Test-CanLaunchBrowser)) {
+        Write-Log -Message 'No interactive browser detected in this environment. Using device code flow for Microsoft Graph.'
+        $useDevice = $true
+    }
+
+    if ($useDevice) {
+        if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        Write-Host ''
+        Write-Host '=== Microsoft Graph sign-in (device code) ==='
+        Write-Host 'Open the URL below on any device, enter the code, and sign in.'
+        Write-Host ''
+        Connect-MgGraph -Scopes $Scopes -NoWelcome -UseDeviceCode
+        return
+    }
+
+    try {
+        Write-Log -Message 'Attempting interactive (browser) Microsoft Graph sign-in.'
+        Connect-MgGraph -Scopes $Scopes -NoWelcome | Out-Null
+    } catch {
+        Write-Log -Level 'WARN' -Message "Interactive Microsoft Graph sign-in failed: $($_.Exception.Message). Falling back to device code."
+        if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        Write-Host ''
+        Write-Host '=== Microsoft Graph sign-in (device code fallback) ==='
+        Write-Host ''
+        Connect-MgGraph -Scopes $Scopes -NoWelcome -UseDeviceCode
+    }
+}
+
+function Connect-Agent365ExchangeOnline {
+    [CmdletBinding()]
+    param(
+        [switch]$UseDeviceCode
+    )
+
+    $useDevice = $UseDeviceCode.IsPresent
+    if ($useDevice) {
+        Write-Log -Message 'Device code authentication requested for Exchange Online.'
+    } elseif (-not (Test-CanLaunchBrowser)) {
+        Write-Log -Message 'No interactive browser detected in this environment. Using device code flow for Exchange Online.'
+        $useDevice = $true
+    }
+
+    if ($useDevice) {
+        if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        Write-Host ''
+        Write-Host '=== Exchange Online sign-in (device code) ==='
+        Write-Host 'Open the URL below on any device, enter the code, and sign in.'
+        Write-Host ''
+        Connect-ExchangeOnline -ShowBanner:$false -Device
+        return
+    }
+
+    try {
+        Write-Log -Message 'Attempting interactive (browser) Exchange Online sign-in.'
+        Connect-ExchangeOnline -ShowBanner:$false | Out-Null
+    } catch {
+        Write-Log -Level 'WARN' -Message "Interactive Exchange Online sign-in failed: $($_.Exception.Message). Falling back to device code."
+        if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        Write-Host ''
+        Write-Host '=== Exchange Online sign-in (device code fallback) ==='
+        Write-Host ''
+        Connect-ExchangeOnline -ShowBanner:$false -Device
+    }
+}
+
 function Get-ActiveUsersFromUnifiedAudit {
     param(
         [Parameter(Mandatory = $true)]
@@ -179,8 +294,7 @@ function Get-ActiveUsersFromUnifiedAudit {
     }
 
     if (-not $connectionInfo) {
-        Write-Log -Message 'Connecting to Exchange Online for Unified Audit Log access.'
-        Connect-ExchangeOnline -ShowBanner:$false | Out-Null
+        Connect-Agent365ExchangeOnline -UseDeviceCode:$UseDeviceCode
     }
 
     $startDate = (Get-Date).ToUniversalTime().AddDays(-$Days)
@@ -206,6 +320,111 @@ function Get-ActiveUsersFromUnifiedAudit {
     Write-VerboseLog -Message "Unified Audit Log records retrieved: $($records.Count). Unique active users: $($activeUsers.Count)."
 
     return $activeUsers
+}
+
+function ConvertFrom-CopilotSummaryCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CsvText,
+        [Parameter(Mandatory = $true)]
+        [string]$Period
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CsvText)) { return $null }
+
+    $rows = $CsvText | ConvertFrom-Csv
+    if (-not $rows) { return $null }
+    $row = @($rows) | Select-Object -First 1
+    if (-not $row) { return $null }
+
+    $toInt = {
+        param($v)
+        if ($null -eq $v) { return 0 }
+        $t = [string]$v
+        if ([string]::IsNullOrWhiteSpace($t)) { return 0 }
+        $n = 0
+        if ([int]::TryParse($t, [ref]$n)) { return $n }
+        return 0
+    }
+
+    $adoption = [PSCustomObject]@{
+        reportPeriod               = [int]($Period.TrimStart('D'))
+        anyAppEnabledUsers         = & $toInt $row.'Any App Enabled Users'
+        anyAppActiveUsers          = & $toInt $row.'Any App Active Users'
+        microsoftTeamsEnabledUsers = & $toInt $row.'Microsoft Teams Enabled Users'
+        microsoftTeamsActiveUsers  = & $toInt $row.'Microsoft Teams Active Users'
+        wordEnabledUsers           = & $toInt $row.'Word Enabled Users'
+        wordActiveUsers            = & $toInt $row.'Word Active Users'
+        powerPointEnabledUsers     = & $toInt $row.'PowerPoint Enabled Users'
+        powerPointActiveUsers      = & $toInt $row.'PowerPoint Active Users'
+        outlookEnabledUsers        = & $toInt $row.'Outlook Enabled Users'
+        outlookActiveUsers         = & $toInt $row.'Outlook Active Users'
+        excelEnabledUsers          = & $toInt $row.'Excel Enabled Users'
+        excelActiveUsers           = & $toInt $row.'Excel Active Users'
+        oneNoteEnabledUsers        = & $toInt $row.'OneNote Enabled Users'
+        oneNoteActiveUsers         = & $toInt $row.'OneNote Active Users'
+        loopEnabledUsers           = & $toInt $row.'Loop Enabled Users'
+        loopActiveUsers            = & $toInt $row.'Loop Active Users'
+        copilotChatEnabledUsers    = & $toInt $row.'Copilot Chat Enabled Users'
+        copilotChatActiveUsers     = & $toInt $row.'Copilot Chat Active Users'
+    }
+
+    return [PSCustomObject]@{
+        value = @(
+            [PSCustomObject]@{
+                reportRefreshDate = [string]$row.'Report Refresh Date'
+                adoptionByProduct = @($adoption)
+            }
+        )
+    }
+}
+
+function Get-CopilotSummaryMetrics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Period
+    )
+
+    $base = "https://graph.microsoft.com/v1.0/copilot/reports/getMicrosoft365CopilotUserCountSummary(period='$Period')"
+
+    # Try JSON-formatted variants first.
+    $jsonUris = @(
+        "$base`?`$format=application/json",
+        "$base`?`$format=json",
+        $base
+    )
+
+    foreach ($u in $jsonUris) {
+        try {
+            Write-VerboseLog -Message "Trying Copilot summary URI: $u"
+            $resp = Invoke-MgGraphRequest -Method GET -Uri $u
+            if ($resp -is [string]) {
+                # Likely CSV returned as raw text - try to parse it.
+                $parsed = ConvertFrom-CopilotSummaryCsv -CsvText $resp -Period $Period
+                if ($parsed) { return $parsed }
+            } elseif ($resp -and $resp.value) {
+                return $resp
+            }
+        } catch {
+            Write-VerboseLog -Message "Copilot summary attempt failed for '$u': $($_.Exception.Message)"
+        }
+    }
+
+    # Final fallback: ask explicitly for CSV and parse it.
+    try {
+        $csvUri = "$base`?`$format=text/csv"
+        Write-VerboseLog -Message "Falling back to CSV: $csvUri"
+        $csvResp = Invoke-MgGraphRequest -Method GET -Uri $csvUri
+        $csvText = if ($csvResp -is [string]) { $csvResp } else { [string]$csvResp }
+        $parsed = ConvertFrom-CopilotSummaryCsv -CsvText $csvText -Period $Period
+        if ($parsed) { return $parsed }
+    } catch {
+        throw "Failed to retrieve Copilot summary metrics from Graph. Last error: $($_.Exception.Message)"
+    }
+
+    throw 'No data returned from getMicrosoft365CopilotUserCountSummary (no JSON or CSV variant succeeded).'
 }
 
 function Get-CopilotSkuIds {
@@ -645,22 +864,21 @@ try {
 }
 
 if (-not $ctx) {
-    Write-Log -Message 'Connecting to Microsoft Graph.'
-    Connect-MgGraph -Scopes $scopes -NoWelcome | Out-Null
+    Connect-Agent365Graph -Scopes $scopes -UseDeviceCode:$UseDeviceCode
 } elseif (-not ($ctx.Scopes -contains 'Reports.Read.All')) {
     Write-Log -Message 'Reconnecting to Microsoft Graph to include required scopes.'
-    Connect-MgGraph -Scopes $scopes -NoWelcome | Out-Null
+    Connect-Agent365Graph -Scopes $scopes -UseDeviceCode:$UseDeviceCode
 }
 $script:StepId++
 
 Write-Log -Message 'Resolving tenant context for report header.'
 $tenantInfo = Get-TenantContextInfo
 
-# Microsoft recommends the /copilot/reports endpoint for Copilot usage reporting APIs.
+# Microsoft's /copilot/reports endpoints currently return a CSV-backed Stream.
+# Get-CopilotSummaryMetrics tries JSON-format variants first and falls back to CSV.
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Pulling summary metrics from Graph'
 Write-Log -Message 'Requesting Copilot summary usage metrics from Graph.'
-$uri = "https://graph.microsoft.com/v1.0/copilot/reports/getMicrosoft365CopilotUserCountSummary(period='$Period')?`$format=application/json"
-$response = Invoke-MgGraphRequest -Method GET -Uri $uri
+$response = Get-CopilotSummaryMetrics -Period $Period
 
 if (-not $response.value -or $response.value.Count -eq 0) {
     throw 'No data returned from getMicrosoft365CopilotUserCountSummary.'

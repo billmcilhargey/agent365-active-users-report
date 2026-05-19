@@ -27,7 +27,7 @@ The script installs the required Microsoft Graph and Exchange Online modules on 
 pwsh ./Get-Agent365ActiveUsers.ps1
 ```
 
-You will be prompted to sign in to Microsoft Graph and (on first run) to Exchange Online. When the run completes, the HTML report path and log path are printed to the console.
+You will be prompted to sign in to Microsoft Graph and (on first run) to Exchange Online. The script tries an interactive browser sign-in by default and **automatically falls back to device code authentication** in environments where a browser cannot be launched (SSH sessions, GitHub Codespaces, dev containers, headless Linux). Use `-UseDeviceCode` to force device code mode. When the run completes, the HTML report path and log path are printed to the console.
 
 ## Parameters
 
@@ -42,6 +42,7 @@ You will be prompted to sign in to Microsoft Graph and (on first run) to Exchang
 | `-LogPath` | `./Agent365-ActiveUsers.log` | Output path for the execution log. |
 | `-NoProgress` | _off_ | Suppress progress bars. |
 | `-VerboseLog` | _off_ | Log per-user classification details to console and log. |
+| `-UseDeviceCode` | _off_ | Force device code sign-in for Microsoft Graph and Exchange Online. Auto-detected when no browser is available. |
 | `-ReturnRaw` | _off_ | Emit a JSON object with summary + user lists instead of writing the HTML report and tables. |
 
 ## Common usage
@@ -58,6 +59,9 @@ pwsh ./Get-Agent365ActiveUsers.ps1 -NoProgress
 
 # per-user verbose logging
 pwsh ./Get-Agent365ActiveUsers.ps1 -VerboseLog
+
+# force device code sign-in (e.g. SSH, Codespaces, headless servers)
+pwsh ./Get-Agent365ActiveUsers.ps1 -UseDeviceCode
 
 # override Agent 365 license matching
 pwsh ./Get-Agent365ActiveUsers.ps1 `
