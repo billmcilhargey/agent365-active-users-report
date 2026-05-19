@@ -4,22 +4,23 @@ PowerShell reporting utility that produces an HTML report of Agent 365 (Microsof
 
 ## What it does
 
-- Pulls top-level Agent 365 usage summary metrics from Microsoft Graph.
-- Builds active-user lists from the Unified Audit Log.
-- Classifies each active user as licensed or unlicensed based on the tenant's subscribed SKUs.
-- Generates a self-contained HTML report with tabbed user tables.
-- Writes console progress and a persistent execution log.
+- Pulls top-level usage summary metrics from Microsoft Graph (`getMicrosoft365CopilotUserCountSummary`).
+- Pulls the per-user activity list from Microsoft Graph (`getMicrosoft365CopilotUsageUserDetail`) — cross-platform, works on Linux, macOS, and Windows.
+- *(Optional, Windows-only)* also queries the Unified Audit Log for `CopilotInteraction` activity to surface unlicensed Copilot Chat usage that the Graph user-detail report does not include.
+- Classifies each active user as **licensed** or **unlicensed** based on the tenant's subscribed Agent 365 / Copilot SKUs.
+- Generates a self-contained HTML report with tabbed user tables, including a per-user **Last Activity Date** and **Source** column (`Graph`, `UAL`, or `Graph+UAL`).
+- Writes console progress and a fresh execution log on every run.
 
 ## Requirements
 
 - PowerShell 7 or later (`pwsh`).
-- Network access to `graph.microsoft.com` and Exchange Online.
+- Network access to `graph.microsoft.com` (and Exchange Online if you opt in to `-IncludeUnifiedAuditLog`).
 - A sign-in account (interactive) with permission to:
   - Read Microsoft 365 usage reports (Microsoft Graph scope `Reports.Read.All`).
   - Read user and organization data (`User.Read.All`, `Organization.Read.All`).
-  - Search the Unified Audit Log in Exchange Online (e.g. **View-Only Audit Logs** or **Audit Logs** role).
+  - *(Only when `-IncludeUnifiedAuditLog` is used)* Search the Unified Audit Log in Exchange Online (e.g. **View-Only Audit Logs** or **Audit Logs** role).
 
-The script installs the required Microsoft Graph and Exchange Online modules on first run (per-user scope).
+The script installs the required modules on first run (per-user scope). `ExchangeOnlineManagement` is only installed when you opt in to `-IncludeUnifiedAuditLog`.
 
 ## Quick start
 
@@ -27,7 +28,17 @@ The script installs the required Microsoft Graph and Exchange Online modules on 
 pwsh ./Get-Agent365ActiveUsers.ps1
 ```
 
-You will be prompted to sign in to Microsoft Graph and (on first run) to Exchange Online. The script tries an interactive browser sign-in by default and **automatically falls back to device code authentication** in environments where a browser cannot be launched (SSH sessions, GitHub Codespaces, dev containers, headless Linux). Use `-UseDeviceCode` to force device code mode. When the run completes, the HTML report path and log path are printed to the console.
+You will be prompted to sign in to Microsoft Graph. The script tries an interactive browser sign-in by default and **automatically falls back to device code authentication** in environments where a browser cannot be launched (SSH sessions, GitHub Codespaces, dev containers, headless Linux). Use `-UseDeviceCode` to force device code mode. When the run completes, the HTML report path and log path are printed to the console.
+
+### Device code sign-in tips
+
+Microsoft enforces a hard **120-second** timeout from the moment a device code is generated. To make that comfortable:
+
+1. **Open https://login.microsoft.com/device in a browser tab first.**
+2. Start the script. It will prompt: *"When the sign-in page is open and ready, press Enter to receive a fresh code (attempt 1 of 3)..."*
+3. Press Enter, copy the code, paste it on the device-login page, and sign in.
+
+If a code does time out, the script automatically requests up to **3 fresh codes** before giving up — no need to re-run the whole script.
 
 ## Parameters
 
@@ -36,55 +47,72 @@ You will be prompted to sign in to Microsoft Graph and (on first run) to Exchang
 | `-Period` | `D30` | Reporting window: `D7`, `D30`, `D90`, `D180`, or `ALL`. |
 | `-CopilotSkuPartNumbers` | `MICROSOFT_365_COPILOT`, `E7` | Exact SKU part numbers treated as Agent 365 licenses. |
 | `-CopilotSkuPartNumberPatterns` | `*MICROSOFT_365_COPILOT*`, `*E7*`, `*AGENT*`, `*COPILOT*` | Wildcard patterns also matched against subscribed SKU part numbers. |
-| `-AuditOperations` | `CopilotInteraction` | Unified Audit Log operations used to identify active users. |
+| `-IncludeUnifiedAuditLog` | _off_ | **Windows-only.** Also pull `CopilotInteraction` (or `-AuditOperations`) events from the Unified Audit Log and merge with Graph results. Auto-skipped with a warning on Linux/macOS. |
+| `-AuditOperations` | `CopilotInteraction` | Unified Audit Log operations used to identify active users (only applied when `-IncludeUnifiedAuditLog` is set). |
 | `-AuditResultSize` | `5000` | Max audit records returned per query (1–5000). |
 | `-ReportPath` | `./Agent365-ActiveUsers-Report.html` | Output path for the HTML report. |
-| `-LogPath` | `./Agent365-ActiveUsers.log` | Output path for the execution log. |
+| `-LogPath` | `./Agent365-ActiveUsers.log` | Output path for the execution log (recreated on every run). |
 | `-NoProgress` | _off_ | Suppress progress bars. |
 | `-VerboseLog` | _off_ | Log per-user classification details to console and log. |
-| `-UseDeviceCode` | _off_ | Force device code sign-in for Microsoft Graph and Exchange Online. Auto-detected when no browser is available. |
-| `-ReturnRaw` | _off_ | Emit a JSON object with summary + user lists instead of writing the HTML report and tables. |
+| `-UseDeviceCode` | _off_ | Force device code sign-in. Auto-detected when no browser is available. |
+| `-ReturnRaw` | _off_ | Emit a JSON object with summary + user lists + data-source metadata instead of writing the HTML report and tables. |
 
 ## Common usage
 
 ```powershell
-# 7-day report
+# 7-day report (Graph-only, works on any OS)
 pwsh ./Get-Agent365ActiveUsers.ps1 -Period D7
 
-# custom report and log paths
+# Windows: include Unified Audit Log to catch unlicensed Copilot Chat activity
+pwsh ./Get-Agent365ActiveUsers.ps1 -IncludeUnifiedAuditLog
+
+# Custom report and log paths
 pwsh ./Get-Agent365ActiveUsers.ps1 -ReportPath ./reports/agent365.html -LogPath ./logs/agent365.log
 
-# no progress bars (good for CI / unattended)
+# No progress bars (good for CI / unattended)
 pwsh ./Get-Agent365ActiveUsers.ps1 -NoProgress
 
-# per-user verbose logging
+# Per-user verbose logging
 pwsh ./Get-Agent365ActiveUsers.ps1 -VerboseLog
 
-# force device code sign-in (e.g. SSH, Codespaces, headless servers)
+# Force device code sign-in (SSH, Codespaces, headless servers)
 pwsh ./Get-Agent365ActiveUsers.ps1 -UseDeviceCode
 
-# override Agent 365 license matching
+# Override Agent 365 license matching
 pwsh ./Get-Agent365ActiveUsers.ps1 `
   -CopilotSkuPartNumbers 'MICROSOFT_365_COPILOT','E7' `
   -CopilotSkuPartNumberPatterns '*MICROSOFT_365_COPILOT*','*E7*','*AGENT*','*COPILOT*'
 
-# raw JSON output (no HTML, no console tables)
+# Raw JSON output (no HTML, no console tables)
 pwsh ./Get-Agent365ActiveUsers.ps1 -ReturnRaw
 ```
 
+## Data sources
+
+| Source | Endpoint / cmdlet | Used for | Platform |
+| --- | --- | --- | --- |
+| Microsoft Graph summary | `GET /v1.0/copilot/reports/getMicrosoft365CopilotUserCountSummary(period='X')` | Top tiles (Active / Enabled / Copilot Chat active) and per-app counts | Any |
+| Microsoft Graph user detail | `GET /v1.0/reports/getMicrosoft365CopilotUsageUserDetail(period='X')` | Per-user **Last Activity Date** list (rows tagged `Graph`) | Any |
+| Microsoft 365 subscribed SKUs | `GET /v1.0/subscribedSkus` | Resolve Agent 365 / Copilot SKU GUIDs for the licensed-vs-unlicensed split | Any |
+| User license assignments | `GET /v1.0/users/{id}` (`assignedLicenses`) | Per-user license check + canonical DisplayName / ObjectId | Any |
+| Unified Audit Log *(optional)* | `Search-UnifiedAuditLog -Operations CopilotInteraction` | Catches unlicensed Copilot Chat activity not in the Graph user-detail report (rows tagged `UAL` or `Graph+UAL`) | **Windows only** |
+
+The **Source** column in the HTML report indicates which path produced each row.
+
 ## Outputs
 
-- `Agent365-ActiveUsers-Report.html` — tabbed HTML report (summary cards + licensed/unlicensed tables + assumptions).
-- `Agent365-ActiveUsers.log` — execution log with timestamps.
+- `Agent365-ActiveUsers-Report.html` — tabbed HTML report (summary cards + licensed/unlicensed tables + Last Activity Date + Source + assumptions).
+- `Agent365-ActiveUsers.log` — execution log with timestamps. **Recreated on every run** so the log only ever reflects the latest invocation.
 
 Both files are ignored by `.gitignore` and never committed.
 
 ## Notes and caveats
 
-- Licensed/unlicensed classification depends entirely on the configured SKU part numbers and patterns matching a SKU in your tenant. If no SKUs match, the run stops with an error.
-- The active-user identity list comes from the Unified Audit Log; tenants that log different operation names should override `-AuditOperations`.
-- Summary metrics come from Microsoft Graph Copilot reports; user detail lists come from audit records plus Graph user lookups. Timing/latency between sources can produce minor discrepancies.
-- Results depend on Unified Audit Log retention and on the permissions of the signed-in account.
+- The Agent 365 admin center's **active users over time** and **trending agents by active users** charts are not yet exposed via a public Graph API. This report uses the closest API-available signal: per-user Microsoft 365 Copilot activity, optionally augmented with `CopilotInteraction` audit events.
+- Licensed/unlicensed classification depends on the configured SKU part numbers and patterns matching a SKU in your tenant. If no SKUs match, the run stops with an error.
+- Microsoft Graph usage reports typically have a 24–48 hour reporting latency.
+- The `getMicrosoft365CopilotUsageUserDetail` endpoint reports users with assigned Microsoft 365 Copilot / Agent 365 licenses. Unlicensed Copilot Chat activity is only visible when you also enable `-IncludeUnifiedAuditLog` on Windows.
+- The Unified Audit Log step requires `Search-UnifiedAuditLog` from the Exchange Online PowerShell module, which is **Windows-only** in PowerShell 7. The script auto-skips this step with a warning on Linux/macOS instead of failing.
 
 ## Development
 

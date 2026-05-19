@@ -29,7 +29,16 @@ param(
 
     [switch]$VerboseLog,
 
-    [switch]$UseDeviceCode
+    [switch]$UseDeviceCode,
+
+    # Opt in to pulling per-user CopilotInteraction records from the Unified
+    # Audit Log via Exchange Online PowerShell. UAL covers unlicensed Copilot
+    # Chat activity that the Microsoft Graph user-detail report does not
+    # report, but Search-UnifiedAuditLog / Connect-IPPSSession only work on
+    # Windows PowerShell 7. When this switch is off (default), the script
+    # builds the active-user list from Microsoft Graph alone, which works on
+    # Linux/macOS as well as Windows.
+    [switch]$IncludeUnifiedAuditLog
 )
 
 Set-StrictMode -Version Latest
@@ -109,14 +118,78 @@ function Initialize-RequiredModule {
     if (-not (Get-Module -ListAvailable -Name $Name)) {
         Write-Log -Message "Installing module: $Name"
         Write-Host "Installing module: $Name"
-        Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber
+        # PowerShellGet emits noisy WARNING lines about PackageManagement /
+        # PowerShellGet being "currently in use" when it can't refresh its own
+        # bootstrap helpers. Those warnings are harmless for third-party module
+        # installs, so suppress them here to keep the run output clean.
+        Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber -WarningAction SilentlyContinue
     }
 
     Import-Module $Name -ErrorAction Stop
     Write-Log -Message "Module loaded: $Name"
 }
 
-Initialize-RequiredModule -Name 'Microsoft.Graph.Authentication'
+function Invoke-Agent365Preflight {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Period,
+        [Parameter(Mandatory = $true)]
+        [string[]]$RequiredModules,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AuditOperations,
+        [switch]$IncludeUnifiedAuditLog
+    )
+
+    Write-Log -Message ('-' * 72)
+    Write-Log -Message 'Pre-flight checks'
+    Write-Log -Message ('-' * 72)
+
+    $psv = $PSVersionTable.PSVersion
+    Write-Log -Message "PowerShell version: $psv ($($PSVersionTable.PSEdition))"
+    if ($psv.Major -lt 7) {
+        Write-Log -Level 'WARN' -Message "PowerShell 7+ is recommended. Running on $psv."
+    }
+
+    $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
+    Write-Log -Message "Platform: $platformName"
+
+    Write-Log -Message "Report period: $Period"
+    Write-Log -Message 'Primary active-user source: Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
+
+    if ($IncludeUnifiedAuditLog) {
+        if ($AuditOperations -and $AuditOperations.Count -gt 0) {
+            Write-Log -Message "Unified Audit Log operations: $($AuditOperations -join ', ')"
+        } else {
+            Write-Log -Level 'WARN' -Message 'IncludeUnifiedAuditLog is set but -AuditOperations is empty; UAL step will be skipped.'
+        }
+        if (-not $IsWindows) {
+            Write-Log -Level 'WARN' -Message 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. On this platform the UAL step will be skipped and the report will use Graph data only.'
+        }
+    } else {
+        Write-Log -Message 'Unified Audit Log step: disabled (pass -IncludeUnifiedAuditLog to enable on Windows).'
+    }
+
+    Write-Log -Message "Installing/loading required modules: $($RequiredModules -join ', ')"
+    foreach ($m in $RequiredModules) {
+        Initialize-RequiredModule -Name $m
+    }
+
+    Write-Log -Message 'Pre-flight checks complete. Proceeding to authentication.'
+    Write-Log -Message ('-' * 72)
+}
+
+$preflightModules = [System.Collections.Generic.List[string]]::new()
+$preflightModules.Add('Microsoft.Graph.Authentication')
+if ($IncludeUnifiedAuditLog -and $IsWindows) {
+    $preflightModules.Add('ExchangeOnlineManagement')
+}
+
+Invoke-Agent365Preflight `
+    -Period $Period `
+    -RequiredModules $preflightModules.ToArray() `
+    -AuditOperations $AuditOperations `
+    -IncludeUnifiedAuditLog:$IncludeUnifiedAuditLog
 
 function Get-PeriodDays {
     param(
@@ -212,6 +285,56 @@ function Test-CanLaunchBrowser {
     return $true
 }
 
+function Test-CanPromptOnStdin {
+    try {
+        return (-not [System.Console]::IsInputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-DeviceCodeMgGraphSignIn {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Scopes,
+        [int]$MaxAttempts = 3
+    )
+
+    $canPrompt = Test-CanPromptOnStdin
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Host ''
+        Write-Host '=== Microsoft Graph sign-in (device code) ==='
+        Write-Host ''
+        Write-Host 'Microsoft enforces a 120-second timeout once a code is generated.'
+        Write-Host 'For best results, OPEN this URL FIRST in any browser:'
+        Write-Host ''
+        Write-Host '    https://login.microsoft.com/device'
+        Write-Host ''
+
+        if ($canPrompt) {
+            Write-Host ("When the sign-in page is open and ready, press Enter to receive a fresh code (attempt {0} of {1})..." -f $attempt, $MaxAttempts)
+            [void](Read-Host)
+        } else {
+            Write-Host ("Non-interactive shell detected; requesting device code now (attempt {0} of {1})." -f $attempt, $MaxAttempts)
+        }
+
+        try {
+            Connect-MgGraph -Scopes $Scopes -NoWelcome -UseDeviceCode
+            return
+        } catch {
+            $message = $_.Exception.Message
+            $isTransient = ($message -match 'timed out|authorization_pending|expired_token|inactivity')
+            if ($attempt -lt $MaxAttempts -and $isTransient) {
+                Write-Log -Level 'WARN' -Message ("Microsoft Graph sign-in attempt {0} failed: {1}. Retrying with a fresh device code." -f $attempt, $message)
+                continue
+            }
+            throw
+        }
+    }
+}
+
 function Connect-Agent365Graph {
     [CmdletBinding()]
     param(
@@ -230,11 +353,7 @@ function Connect-Agent365Graph {
 
     if ($useDevice) {
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
-        Write-Host ''
-        Write-Host '=== Microsoft Graph sign-in (device code) ==='
-        Write-Host 'Open the URL below on any device, enter the code, and sign in.'
-        Write-Host ''
-        Connect-MgGraph -Scopes $Scopes -NoWelcome -UseDeviceCode
+        Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes
         return
     }
 
@@ -244,10 +363,7 @@ function Connect-Agent365Graph {
     } catch {
         Write-Log -Level 'WARN' -Message "Interactive Microsoft Graph sign-in failed: $($_.Exception.Message). Falling back to device code."
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
-        Write-Host ''
-        Write-Host '=== Microsoft Graph sign-in (device code fallback) ==='
-        Write-Host ''
-        Connect-MgGraph -Scopes $Scopes -NoWelcome -UseDeviceCode
+        Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes
     }
 }
 
@@ -267,11 +383,7 @@ function Connect-Agent365ExchangeOnline {
 
     if ($useDevice) {
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
-        Write-Host ''
-        Write-Host '=== Exchange Online sign-in (device code) ==='
-        Write-Host 'Open the URL below on any device, enter the code, and sign in.'
-        Write-Host ''
-        Connect-ExchangeOnline -ShowBanner:$false -Device
+        Invoke-DeviceCodeExoSignIn
         return
     }
 
@@ -281,10 +393,47 @@ function Connect-Agent365ExchangeOnline {
     } catch {
         Write-Log -Level 'WARN' -Message "Interactive Exchange Online sign-in failed: $($_.Exception.Message). Falling back to device code."
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        Invoke-DeviceCodeExoSignIn
+    }
+}
+
+function Invoke-DeviceCodeExoSignIn {
+    [CmdletBinding()]
+    param(
+        [int]$MaxAttempts = 3
+    )
+
+    $canPrompt = Test-CanPromptOnStdin
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Write-Host ''
-        Write-Host '=== Exchange Online sign-in (device code fallback) ==='
+        Write-Host '=== Exchange Online sign-in (device code) ==='
         Write-Host ''
-        Connect-ExchangeOnline -ShowBanner:$false -Device
+        Write-Host 'Microsoft enforces a short timeout once a code is generated.'
+        Write-Host 'For best results, OPEN this URL FIRST in any browser:'
+        Write-Host ''
+        Write-Host '    https://login.microsoft.com/device'
+        Write-Host ''
+
+        if ($canPrompt) {
+            Write-Host ("When the sign-in page is open and ready, press Enter to receive a fresh code (attempt {0} of {1})..." -f $attempt, $MaxAttempts)
+            [void](Read-Host)
+        } else {
+            Write-Host ("Non-interactive shell detected; requesting device code now (attempt {0} of {1})." -f $attempt, $MaxAttempts)
+        }
+
+        try {
+            Connect-ExchangeOnline -ShowBanner:$false -Device
+            return
+        } catch {
+            $message = $_.Exception.Message
+            $isTransient = ($message -match 'timed out|authorization_pending|expired_token|inactivity')
+            if ($attempt -lt $MaxAttempts -and $isTransient) {
+                Write-Log -Level 'WARN' -Message ("Exchange Online sign-in attempt {0} failed: {1}. Retrying with a fresh device code." -f $attempt, $message)
+                continue
+            }
+            throw
+        }
     }
 }
 
@@ -298,7 +447,15 @@ function Get-ActiveUsersFromUnifiedAudit {
         [int]$ResultSize
     )
 
-    Initialize-RequiredModule -Name 'ExchangeOnlineManagement'
+    if (-not $IsWindows) {
+        Write-Log -Level 'WARN' -Message 'Skipping Unified Audit Log step: Search-UnifiedAuditLog / Connect-IPPSSession require Exchange Online PowerShell on Windows. The Graph user-detail report is being used instead.'
+        return @()
+    }
+
+    if (-not $Operations -or $Operations.Count -eq 0) {
+        Write-Log -Level 'WARN' -Message 'Skipping Unified Audit Log step: -AuditOperations is empty.'
+        return @()
+    }
 
     try {
         $connectionInfo = Get-ConnectionInformation -ErrorAction Stop
@@ -326,13 +483,24 @@ function Get-ActiveUsersFromUnifiedAudit {
         return @()
     }
 
-    $activeUsers = $records |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_.UserIds) } |
-        Select-Object -ExpandProperty UserIds -Unique
+    $byUpn = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $records) {
+        $upn = $null
+        try { $upn = [string]$r.UserIds } catch { $upn = $null }
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+        if (-not $byUpn.ContainsKey($upn)) {
+            $byUpn[$upn] = [PSCustomObject]@{
+                UserPrincipalName = $upn
+                DisplayName       = $null
+                LastActivityDate  = $null
+                Source            = 'UAL'
+            }
+        }
+    }
 
-    Write-VerboseLog -Message "Unified Audit Log records retrieved: $($records.Count). Unique active users: $($activeUsers.Count)."
+    Write-VerboseLog -Message "Unified Audit Log records retrieved: $($records.Count). Unique active users: $($byUpn.Count)."
 
-    return $activeUsers
+    return @($byUpn.Values)
 }
 
 function ConvertFrom-CopilotSummaryCsv {
@@ -454,6 +622,203 @@ function Get-CopilotSummaryMetrics {
     throw 'No data returned from getMicrosoft365CopilotUserCountSummary (no JSON or CSV variant succeeded).'
 }
 
+function ConvertFrom-CopilotUserDetailCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CsvText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CsvText)) { return @() }
+
+    $rows = $CsvText | ConvertFrom-Csv
+    if (-not $rows) { return @() }
+
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($rows)) {
+        $rec = [PSCustomObject]@{
+            reportRefreshDate                    = [string]$row.'Report Refresh Date'
+            userPrincipalName                    = [string]$row.'User Principal Name'
+            displayName                          = [string]$row.'Display Name'
+            lastActivityDate                     = [string]$row.'Last Activity Date'
+            microsoftTeamsCopilotLastActivityDate = [string]$row.'Microsoft Teams Copilot Last Activity Date'
+            wordCopilotLastActivityDate           = [string]$row.'Word Copilot Last Activity Date'
+            excelCopilotLastActivityDate          = [string]$row.'Excel Copilot Last Activity Date'
+            powerPointCopilotLastActivityDate     = [string]$row.'PowerPoint Copilot Last Activity Date'
+            outlookCopilotLastActivityDate        = [string]$row.'Outlook Copilot Last Activity Date'
+            oneNoteCopilotLastActivityDate        = [string]$row.'OneNote Copilot Last Activity Date'
+            loopCopilotLastActivityDate           = [string]$row.'Loop Copilot Last Activity Date'
+            copilotChatLastActivityDate           = [string]$row.'Copilot Chat Last Activity Date'
+        }
+        $records.Add($rec)
+    }
+
+    return $records.ToArray()
+}
+
+function Get-CopilotUserDetail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Period
+    )
+
+    # The Microsoft 365 Copilot user-detail report lives under /reports (not
+    # /copilot/reports) and supports the same JSON/CSV format switching as the
+    # summary report. We prefer JSON for the inline+paginated shape and fall
+    # back to CSV (delivered via a 302 to a download URL) when JSON is refused.
+    $base = "https://graph.microsoft.com/v1.0/reports/getMicrosoft365CopilotUsageUserDetail(period='$Period')"
+
+    $jsonUris = @(
+        "$base`?`$format=application/json",
+        "$base`?`$format=json",
+        $base
+    )
+
+    foreach ($u in $jsonUris) {
+        try {
+            Write-VerboseLog -Message "Trying Copilot user-detail URI: $u"
+            $records = New-Object System.Collections.Generic.List[object]
+            $next = $u
+            $page = 0
+            while ($next) {
+                $page++
+                $resp = Invoke-MgGraphRequest -Method GET -Uri $next
+                if ($resp -is [string]) {
+                    # JSON path returned raw text - probably CSV. Parse it and stop paging.
+                    $parsed = ConvertFrom-CopilotUserDetailCsv -CsvText $resp
+                    foreach ($p in @($parsed)) { $records.Add($p) }
+                    $next = $null
+                    break
+                }
+                if ($resp -and $resp.value) {
+                    foreach ($v in @($resp.value)) { $records.Add($v) }
+                }
+                $next = $null
+                if ($resp -and $resp.'@odata.nextLink') {
+                    $next = [string]$resp.'@odata.nextLink'
+                    Write-VerboseLog -Message "Following nextLink (page $page)"
+                }
+            }
+            if ($records.Count -gt 0) {
+                Write-VerboseLog -Message "Copilot user-detail rows retrieved (JSON path): $($records.Count)"
+                return $records.ToArray()
+            }
+        } catch {
+            Write-VerboseLog -Message "Copilot user-detail attempt failed for '$u': $($_.Exception.Message)"
+        }
+    }
+
+    # CSV fallback via temp file (mirrors Get-CopilotSummaryMetrics).
+    $tmpCsv = $null
+    try {
+        $csvUri = "$base`?`$format=text/csv"
+        $tmpCsv = [System.IO.Path]::Combine(
+            [System.IO.Path]::GetTempPath(),
+            "copilot-user-detail-$([guid]::NewGuid()).csv"
+        )
+        Write-VerboseLog -Message "Falling back to user-detail CSV via temp file: $csvUri -> $tmpCsv"
+        Invoke-MgGraphRequest -Method GET -Uri $csvUri -OutputFilePath $tmpCsv | Out-Null
+        if (-not (Test-Path -LiteralPath $tmpCsv)) {
+            throw "Graph did not write any CSV output to '$tmpCsv'."
+        }
+        $csvText = Get-Content -LiteralPath $tmpCsv -Raw
+        $records = ConvertFrom-CopilotUserDetailCsv -CsvText $csvText
+        Write-VerboseLog -Message "Copilot user-detail rows retrieved (CSV path): $($records.Count)"
+        return @($records)
+    } catch {
+        throw "Failed to retrieve Copilot user detail from Graph. Last error: $($_.Exception.Message)"
+    } finally {
+        if ($tmpCsv -and (Test-Path -LiteralPath $tmpCsv)) {
+            Remove-Item -LiteralPath $tmpCsv -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function ConvertTo-Agent365ActiveUserCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object[]]$UserDetailRecords
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+    if (-not $UserDetailRecords) { return $candidates.ToArray() }
+
+    foreach ($r in $UserDetailRecords) {
+        if (-not $r) { continue }
+        $upn = $null
+        try { $upn = [string]$r.userPrincipalName } catch { $upn = $null }
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+
+        $last = $null
+        try { $last = [string]$r.lastActivityDate } catch { $last = $null }
+
+        # Only count users who have an actual lastActivityDate inside the
+        # requested window. A blank lastActivityDate means "enabled but never
+        # active during this period".
+        if ([string]::IsNullOrWhiteSpace($last)) { continue }
+
+        $displayName = $null
+        try { $displayName = [string]$r.displayName } catch { $displayName = $null }
+
+        $candidates.Add([PSCustomObject]@{
+            UserPrincipalName = $upn
+            DisplayName       = $displayName
+            LastActivityDate  = $last
+            Source            = 'Graph'
+        })
+    }
+
+    return $candidates.ToArray()
+}
+
+function Merge-Agent365ActiveUserCandidates {
+    [CmdletBinding()]
+    param(
+        [object[]]$GraphCandidates,
+        [object[]]$AuditCandidates
+    )
+
+    $byKey = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($g in @($GraphCandidates)) {
+        if (-not $g) { continue }
+        $upn = [string]$g.UserPrincipalName
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+        $byKey[$upn] = [PSCustomObject]@{
+            UserPrincipalName = $upn
+            DisplayName       = $g.DisplayName
+            LastActivityDate  = $g.LastActivityDate
+            Source            = 'Graph'
+        }
+    }
+
+    foreach ($a in @($AuditCandidates)) {
+        if (-not $a) { continue }
+        $upn = if ($a -is [string]) { $a } else { [string]$a.UserPrincipalName }
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+        if ($byKey.ContainsKey($upn)) {
+            $existing = $byKey[$upn]
+            $existing.Source = 'Graph+UAL'
+            if ([string]::IsNullOrWhiteSpace([string]$existing.DisplayName) -and -not ($a -is [string]) -and -not [string]::IsNullOrWhiteSpace([string]$a.DisplayName)) {
+                $existing.DisplayName = [string]$a.DisplayName
+            }
+        } else {
+            $displayName = if ($a -is [string]) { $null } else { [string]$a.DisplayName }
+            $byKey[$upn] = [PSCustomObject]@{
+                UserPrincipalName = $upn
+                DisplayName       = $displayName
+                LastActivityDate  = $null
+                Source            = 'UAL'
+            }
+        }
+    }
+
+    return @($byKey.Values)
+}
+
 function Get-CopilotSkuIds {
     param(
         [Parameter(Mandatory = $true)]
@@ -502,7 +867,8 @@ function Get-CopilotSkuIds {
 function Get-ActiveUserLicenseClassification {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$ActiveUsers,
+        [AllowEmptyCollection()]
+        [object[]]$ActiveUsers,
         [Parameter(Mandatory = $true)]
         [Guid[]]$CopilotSkuIds
     )
@@ -516,18 +882,36 @@ function Get-ActiveUserLicenseClassification {
     $total = $ActiveUsers.Count
     $index = 0
 
-    foreach ($userId in $ActiveUsers) {
+    foreach ($candidate in $ActiveUsers) {
         $index++
         if (-not $NoProgress) {
             $pct = if ($total -eq 0) { 100 } else { [math]::Round(($index / $total) * 100, 0) }
             Write-Progress -Id 2 -Activity 'Classifying active users by Agent 365 license' -Status "Processing $index of $total" -PercentComplete $pct
         }
 
+        if ($candidate -is [string]) {
+            $upn = $candidate
+            $candidateDisplayName = $null
+            $candidateLastActivity = $null
+            $candidateSource = 'UAL'
+        } else {
+            $upn = [string]$candidate.UserPrincipalName
+            $candidateDisplayName = try { [string]$candidate.DisplayName } catch { $null }
+            $candidateLastActivity = try { [string]$candidate.LastActivityDate } catch { $null }
+            $candidateSource = try { [string]$candidate.Source } catch { 'Graph' }
+            if ([string]::IsNullOrWhiteSpace($candidateSource)) { $candidateSource = 'Graph' }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($upn)) {
+            Write-VerboseLog -Message 'Skipping candidate with empty UserPrincipalName.'
+            continue
+        }
+
         try {
-            $encodedUserId = [uri]::EscapeDataString($userId)
+            $encodedUserId = [uri]::EscapeDataString($upn)
             $user = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$encodedUserId?`$select=id,userPrincipalName,displayName,assignedLicenses"
         } catch {
-            Write-Log -Level 'WARN' -Message "Skipping user '$userId' due to lookup failure."
+            Write-Log -Level 'WARN' -Message "Skipping user '$upn' due to lookup failure."
             continue
         }
 
@@ -544,49 +928,62 @@ function Get-ActiveUserLicenseClassification {
             }
         }
 
-                $record = [PSCustomObject]@{
-                        UserPrincipalName = $user.userPrincipalName
-                        DisplayName       = $user.displayName
-                        ObjectId          = $user.id
-                        IsAgent365Licensed = $hasCopilot
-                }
+        $resolvedDisplayName = if ([string]::IsNullOrWhiteSpace([string]$user.displayName)) { $candidateDisplayName } else { [string]$user.displayName }
 
-                if ($hasCopilot) {
-                        $licensed.Add($record)
-                        Write-VerboseLog -Message "Licensed user: $($record.UserPrincipalName) ($($record.ObjectId))"
-                } else {
-                        $unlicensed.Add($record)
-                        Write-VerboseLog -Message "Unlicensed user: $($record.UserPrincipalName) ($($record.ObjectId))"
-                }
+        $record = [PSCustomObject]@{
+            UserPrincipalName  = [string]$user.userPrincipalName
+            DisplayName        = $resolvedDisplayName
+            ObjectId           = [string]$user.id
+            IsAgent365Licensed = $hasCopilot
+            LastActivityDate   = $candidateLastActivity
+            Source             = $candidateSource
         }
 
-        if (-not $NoProgress) {
-            Write-Progress -Id 2 -Activity 'Classifying active users by Agent 365 license' -Completed
+        if ($hasCopilot) {
+            $licensed.Add($record)
+            Write-VerboseLog -Message "Licensed user: $($record.UserPrincipalName) ($($record.ObjectId)) [$($record.Source)]"
+        } else {
+            $unlicensed.Add($record)
+            Write-VerboseLog -Message "Unlicensed user: $($record.UserPrincipalName) ($($record.ObjectId)) [$($record.Source)]"
         }
+    }
 
-        Write-Log -Message "Classified users. Licensed: $($licensed.Count), Unlicensed: $($unlicensed.Count)"
+    if (-not $NoProgress) {
+        Write-Progress -Id 2 -Activity 'Classifying active users by Agent 365 license' -Completed
+    }
 
-        return [PSCustomObject]@{
-                Licensed   = $licensed
-                Unlicensed = $unlicensed
-        }
+    Write-Log -Message "Classified users. Licensed: $($licensed.Count), Unlicensed: $($unlicensed.Count)"
+
+    return [PSCustomObject]@{
+        Licensed   = $licensed
+        Unlicensed = $unlicensed
+    }
 }
 
 function Convert-UsersToHtmlRows {
         param(
                 [Parameter(Mandatory = $true)]
+                [AllowEmptyCollection()]
                 [object[]]$Users
         )
 
         if (-not $Users -or $Users.Count -eq 0) {
-                return '<tr><td colspan="3">No users found.</td></tr>'
+                return '<tr><td colspan="5">No users found.</td></tr>'
         }
 
         $rows = foreach ($u in ($Users | Sort-Object UserPrincipalName)) {
                 $upn = [System.Net.WebUtility]::HtmlEncode([string]$u.UserPrincipalName)
                 $name = [System.Net.WebUtility]::HtmlEncode([string]$u.DisplayName)
                 $oid = [System.Net.WebUtility]::HtmlEncode([string]$u.ObjectId)
-                "<tr><td>$upn</td><td>$name</td><td>$oid</td></tr>"
+                $lastRaw = $null
+                try { $lastRaw = [string]$u.LastActivityDate } catch { $lastRaw = $null }
+                if ([string]::IsNullOrWhiteSpace($lastRaw)) { $lastRaw = '' }
+                $last = [System.Net.WebUtility]::HtmlEncode($lastRaw)
+                $srcRaw = $null
+                try { $srcRaw = [string]$u.Source } catch { $srcRaw = $null }
+                if ([string]::IsNullOrWhiteSpace($srcRaw)) { $srcRaw = 'Graph' }
+                $src = [System.Net.WebUtility]::HtmlEncode($srcRaw)
+                "<tr><td>$upn</td><td>$name</td><td>$oid</td><td>$last</td><td>$src</td></tr>"
         }
 
         return ($rows -join [Environment]::NewLine)
@@ -599,13 +996,17 @@ function New-Agent365HtmlReport {
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Summary,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$LicensedUsers,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$UnlicensedUsers,
         [Parameter(Mandatory = $true)]
         [string[]]$MatchedSkuPartNumbers,
         [Parameter(Mandatory = $true)]
-        [pscustomobject]$TenantInfo
+        [pscustomobject]$TenantInfo,
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$DataSources
     )
 
     $licensedRows = Convert-UsersToHtmlRows -Users $LicensedUsers
@@ -766,7 +1167,7 @@ function New-Agent365HtmlReport {
             <div id="licensed" class="tab active">
                 <table>
                     <thead>
-                        <tr><th>UserPrincipalName</th><th>DisplayName</th><th>ObjectId</th></tr>
+                        <tr><th>UserPrincipalName</th><th>DisplayName</th><th>ObjectId</th><th>Last Activity Date</th><th>Source</th></tr>
                     </thead>
                     <tbody>
 $licensedRows
@@ -777,7 +1178,7 @@ $licensedRows
             <div id="unlicensed" class="tab">
                 <table>
                     <thead>
-                        <tr><th>UserPrincipalName</th><th>DisplayName</th><th>ObjectId</th></tr>
+                        <tr><th>UserPrincipalName</th><th>DisplayName</th><th>ObjectId</th><th>Last Activity Date</th><th>Source</th></tr>
                     </thead>
                     <tbody>
 $unlicensedRows
@@ -788,12 +1189,12 @@ $unlicensedRows
             <div class="notes">
                 <h2>Notes, Assumptions, and Caveats</h2>
                 <ul>
+                    <li><strong>Summary metrics</strong> (top tiles) come from Microsoft Graph <code>getMicrosoft365CopilotUserCountSummary</code> for the period <code>$($Summary.Period)</code>.</li>
+                    <li><strong>Per-user list</strong> comes from Microsoft Graph <code>getMicrosoft365CopilotUsageUserDetail</code>. This endpoint reports users with assigned Microsoft 365 Copilot / Agent 365 licenses; the <em>Source</em> column shows <code>Graph</code> for these rows.$($DataSources.UalNoteHtml)</li>
                     <li>How Agent 365 license is determined: the script matches tenant subscribed SKUs using exact SKU part numbers ($($CopilotSkuPartNumbers -join ', ')) plus wildcard patterns ($($CopilotSkuPartNumberPatterns -join ', ')), then maps these to skuId GUIDs. Each active user is marked licensed only if any users/{id}.assignedLicenses.skuId matches one of those GUIDs.</li>
                     <li>SKUs matched in this tenant for this run: $($MatchedSkuPartNumbers -join ', ').</li>
-                    <li>Active user identity lists come from Unified Audit Log operations: $($AuditOperations -join ', '). If your tenant logs different operation names, totals may differ.</li>
-                    <li>Summary metrics (top cards) come from Microsoft Graph Copilot reports; user detail lists come from audit records and Graph user lookup. These sources can have timing/latency differences.</li>
-                    <li>Report accuracy depends on retention and availability of Unified Audit Log data and permissions for Graph and Exchange Online access.</li>
-                    <li>This script queries up to $AuditResultSize audit records per run (configurable via -AuditResultSize, max 5000).</li>
+                    <li><strong>Active users (per the Agent 365 admin center)</strong> — the per-agent breakdown and “trending agents” view shown in <em>Microsoft 365 admin center &rarr; Agent 365</em> are not yet exposed via a public Graph API. This report reflects the closest API-available signal: per-user Microsoft 365 Copilot activity (plus, optionally, audit log activity).</li>
+                    <li>Report accuracy depends on Graph reporting latency (typically 24–48 hours), license assignment freshness, and your tenant’s Reports.Read.All / User.Read.All permissions.</li>
                 </ul>
             </div>
         </div>
@@ -873,10 +1274,11 @@ $unlicensedRows
 function Get-UserTableProjection {
         param(
                 [Parameter(Mandatory = $true)]
+                [AllowEmptyCollection()]
                 [object[]]$Users
         )
 
-        return $Users | Select-Object UserPrincipalName, DisplayName, ObjectId
+        return $Users | Select-Object UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
 }
 
 $scopes = @('Reports.Read.All', 'User.Read.All', 'Organization.Read.All')
@@ -931,11 +1333,35 @@ $result = [PSCustomObject]@{
 }
 $script:StepId++
 
-Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from audit log'
-Write-Log -Message 'Collecting active users from Unified Audit Log.'
+Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from Microsoft Graph'
+Write-Log -Message 'Pulling per-user activity from Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
 $days = Get-PeriodDays -PeriodValue $Period
-$activeUsersFromAudit = Get-ActiveUsersFromUnifiedAudit -Days $days -Operations $AuditOperations -ResultSize $AuditResultSize
+$userDetailRecords = Get-CopilotUserDetail -Period $Period
+$graphCandidates = ConvertTo-Agent365ActiveUserCandidate -UserDetailRecords $userDetailRecords
+Write-Log -Message "Graph reported $($graphCandidates.Count) users with activity in the last $days day(s)."
 $script:StepId++
+
+$auditCandidates = @()
+$ualAttempted = $false
+$ualSkippedReason = $null
+if ($IncludeUnifiedAuditLog) {
+    $ualAttempted = $true
+    if (-not $IsWindows) {
+        $ualSkippedReason = 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. Skipped on this platform.'
+        Write-Log -Level 'WARN' -Message $ualSkippedReason
+    } else {
+        Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from Unified Audit Log'
+        Write-Log -Message 'Collecting active users from Unified Audit Log.'
+        $auditCandidates = Get-ActiveUsersFromUnifiedAudit -Days $days -Operations $AuditOperations -ResultSize $AuditResultSize
+        Write-Log -Message "UAL returned $($auditCandidates.Count) unique users."
+    }
+} else {
+    Write-Log -Message 'Unified Audit Log step skipped (pass -IncludeUnifiedAuditLog on Windows to include).'
+}
+$script:StepId++
+
+$mergedCandidates = Merge-Agent365ActiveUserCandidates -GraphCandidates $graphCandidates -AuditCandidates $auditCandidates
+Write-Log -Message "Merged candidate count after dedup: $($mergedCandidates.Count)."
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Resolving Agent 365 SKUs'
 Write-Log -Message 'Resolving Agent 365 SKU IDs from subscribed SKUs.'
@@ -945,8 +1371,8 @@ $matchedSkuPartNumbers = @($skuMatchResults.MatchedSkuPartNumbers)
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Classifying licensed vs unlicensed users'
-Write-Log -Message "Classifying $($activeUsersFromAudit.Count) active users by license assignment."
-$classification = Get-ActiveUserLicenseClassification -ActiveUsers $activeUsersFromAudit -CopilotSkuIds $copilotSkuIds
+Write-Log -Message "Classifying $($mergedCandidates.Count) active users by license assignment."
+$classification = Get-ActiveUserLicenseClassification -ActiveUsers $mergedCandidates -CopilotSkuIds $copilotSkuIds
 $script:StepId++
 
 $licensedActiveUsers = @($classification.Licensed)
@@ -955,19 +1381,42 @@ $unlicensedActiveUsers = @($classification.Unlicensed)
 $licensedTableUsers = Get-UserTableProjection -Users $licensedActiveUsers
 $unlicensedTableUsers = Get-UserTableProjection -Users $unlicensedActiveUsers
 
+# Describe which data sources actually contributed to this report so the HTML
+# notes block can render an accurate disclaimer.
+$ualNoteHtml = if ($IncludeUnifiedAuditLog -and $IsWindows) {
+    " Unified Audit Log was also queried for operations [$($AuditOperations -join ', ')]; rows tagged <code>UAL</code> or <code>Graph+UAL</code> were observed there."
+} elseif ($IncludeUnifiedAuditLog) {
+    ' Unified Audit Log was requested but skipped because Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows.'
+} else {
+    ' The Unified Audit Log path is disabled by default. Pass <code>-IncludeUnifiedAuditLog</code> on Windows to also include unlicensed Copilot Chat activity from audit records.'
+}
+
+$dataSources = [PSCustomObject]@{
+    GraphUserDetail   = $true
+    GraphCandidates   = $graphCandidates.Count
+    UalRequested      = [bool]$IncludeUnifiedAuditLog
+    UalAttempted      = [bool]$ualAttempted
+    UalSkippedReason  = $ualSkippedReason
+    UalCandidates     = $auditCandidates.Count
+    MergedCandidates  = $mergedCandidates.Count
+    AuditOperations   = $AuditOperations
+    UalNoteHtml       = $ualNoteHtml
+}
+
 if ($ReturnRaw) {
     $reportFullPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $ReportPath))
 
     [PSCustomObject]@{
-        Summary                    = $result
-        ActiveLicensedUsersTotal   = $licensedTableUsers.Count
-        ActiveUnlicensedUsersTotal = $unlicensedTableUsers.Count
-        InputAgent365SkuPartNumbers = $CopilotSkuPartNumbers
-        InputAgent365SkuPatterns    = $CopilotSkuPartNumberPatterns
+        Summary                       = $result
+        ActiveLicensedUsersTotal      = $licensedTableUsers.Count
+        ActiveUnlicensedUsersTotal    = $unlicensedTableUsers.Count
+        InputAgent365SkuPartNumbers   = $CopilotSkuPartNumbers
+        InputAgent365SkuPatterns      = $CopilotSkuPartNumberPatterns
         MatchedAgent365SkuPartNumbers = $matchedSkuPartNumbers
-        LicensedActiveUsers        = $licensedTableUsers
-        UnlicensedActiveUsers      = $unlicensedTableUsers
-        ReportPath                 = $reportFullPath
+        LicensedActiveUsers           = $licensedTableUsers
+        UnlicensedActiveUsers         = $unlicensedTableUsers
+        DataSources                   = $dataSources
+        ReportPath                    = $reportFullPath
     } | ConvertTo-Json -Depth 8
     Write-Log -Message 'Completed run in ReturnRaw mode.'
     if (-not $NoProgress) {
@@ -985,8 +1434,18 @@ Write-Host "Agent 365 SKU pattern matches configured: $($CopilotSkuPartNumberPat
 Write-Host "Agent 365 SKUs matched in tenant: $($matchedSkuPartNumbers -join ', ')"
 Write-Host "Active Licensed Users Total: $($licensedTableUsers.Count)"
 Write-Host "Active Unlicensed Users Total: $($unlicensedTableUsers.Count)"
+Write-Host "Graph user-detail rows: $($dataSources.GraphCandidates)"
+if ($dataSources.UalRequested) {
+    if ($dataSources.UalSkippedReason) {
+        Write-Host "Unified Audit Log: skipped ($($dataSources.UalSkippedReason))"
+    } else {
+        Write-Host "Unified Audit Log unique users: $($dataSources.UalCandidates)"
+    }
+} else {
+    Write-Host 'Unified Audit Log: disabled (pass -IncludeUnifiedAuditLog on Windows to enable).'
+}
 
-New-Agent365HtmlReport -OutputPath $ReportPath -Summary $result -LicensedUsers $licensedTableUsers -UnlicensedUsers $unlicensedTableUsers -MatchedSkuPartNumbers $matchedSkuPartNumbers -TenantInfo $tenantInfo
+New-Agent365HtmlReport -OutputPath $ReportPath -Summary $result -LicensedUsers $licensedTableUsers -UnlicensedUsers $unlicensedTableUsers -MatchedSkuPartNumbers $matchedSkuPartNumbers -TenantInfo $tenantInfo -DataSources $dataSources
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Finalizing report output'
@@ -1001,7 +1460,7 @@ if ($VerboseLog) {
 Write-Host ''
 Write-Host 'Licensed Active Users (Agent 365):'
 if ($licensedTableUsers.Count -gt 0) {
-    $licensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId
+    $licensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
 } else {
     Write-Host 'No licensed active users found.'
 }
@@ -1009,7 +1468,7 @@ if ($licensedTableUsers.Count -gt 0) {
 Write-Host ''
 Write-Host 'Unlicensed Active Users (Agent 365):'
 if ($unlicensedTableUsers.Count -gt 0) {
-    $unlicensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId
+    $unlicensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
 } else {
     Write-Host 'No unlicensed active users found.'
 }
