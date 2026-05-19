@@ -1,33 +1,50 @@
 # agent365-active-users-report
 
-PowerShell reporting utility for Agent 365 usage in Microsoft 365.
+PowerShell reporting utility that produces an HTML report of Agent 365 (Microsoft 365 Copilot) active users, split into **licensed** and **unlicensed** active users for a configurable reporting period.
 
-## What This Script Does
+## What it does
 
-- Pulls top-level Agent 365 usage summary metrics.
-- Builds detailed active-user lists split by:
-  - Licensed Agent 365 users
-  - Unlicensed active users
-- Generates an HTML report with tabbed user tables.
-- Writes real-time console progress and a persistent execution log.
+- Pulls top-level Agent 365 usage summary metrics from Microsoft Graph.
+- Builds active-user lists from the Unified Audit Log.
+- Classifies each active user as licensed or unlicensed based on the tenant's subscribed SKUs.
+- Generates a self-contained HTML report with tabbed user tables.
+- Writes console progress and a persistent execution log.
 
-## Script
+## Requirements
 
-- `Get-Agent365ActiveUsers.ps1`
+- PowerShell 7 or later (`pwsh`).
+- Network access to `graph.microsoft.com` and Exchange Online.
+- A sign-in account (interactive) with permission to:
+  - Read Microsoft 365 usage reports (Microsoft Graph scope `Reports.Read.All`).
+  - Read user and organization data (`User.Read.All`, `Organization.Read.All`).
+  - Search the Unified Audit Log in Exchange Online (e.g. **View-Only Audit Logs** or **Audit Logs** role).
 
-## Quick Start
+The script installs the required Microsoft Graph and Exchange Online modules on first run (per-user scope).
+
+## Quick start
 
 ```powershell
 pwsh ./Get-Agent365ActiveUsers.ps1
 ```
 
-## Prerequisites
+You will be prompted to sign in to Microsoft Graph and (on first run) to Exchange Online. When the run completes, the HTML report path and log path are printed to the console.
 
-- PowerShell 7+
-- Permissions/roles to read Microsoft 365 usage reports (`Reports.Read.All`) and query Unified Audit Log
-- Access to connect Microsoft Graph and Exchange Online PowerShell modules
+## Parameters
 
-## Common Options
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `-Period` | `D30` | Reporting window: `D7`, `D30`, `D90`, `D180`, or `ALL`. |
+| `-CopilotSkuPartNumbers` | `MICROSOFT_365_COPILOT`, `E7` | Exact SKU part numbers treated as Agent 365 licenses. |
+| `-CopilotSkuPartNumberPatterns` | `*MICROSOFT_365_COPILOT*`, `*E7*`, `*AGENT*`, `*COPILOT*` | Wildcard patterns also matched against subscribed SKU part numbers. |
+| `-AuditOperations` | `CopilotInteraction` | Unified Audit Log operations used to identify active users. |
+| `-AuditResultSize` | `5000` | Max audit records returned per query (1–5000). |
+| `-ReportPath` | `./Agent365-ActiveUsers-Report.html` | Output path for the HTML report. |
+| `-LogPath` | `./Agent365-ActiveUsers.log` | Output path for the execution log. |
+| `-NoProgress` | _off_ | Suppress progress bars. |
+| `-VerboseLog` | _off_ | Log per-user classification details to console and log. |
+| `-ReturnRaw` | _off_ | Emit a JSON object with summary + user lists instead of writing the HTML report and tables. |
+
+## Common usage
 
 ```powershell
 # 7-day report
@@ -36,22 +53,35 @@ pwsh ./Get-Agent365ActiveUsers.ps1 -Period D7
 # custom report and log paths
 pwsh ./Get-Agent365ActiveUsers.ps1 -ReportPath ./reports/agent365.html -LogPath ./logs/agent365.log
 
-# disable progress bars
+# no progress bars (good for CI / unattended)
 pwsh ./Get-Agent365ActiveUsers.ps1 -NoProgress
 
-# enable per-user verbose logging to console and log file
+# per-user verbose logging
 pwsh ./Get-Agent365ActiveUsers.ps1 -VerboseLog
 
-# control audit query size (1-5000)
-pwsh ./Get-Agent365ActiveUsers.ps1 -AuditResultSize 5000
+# override Agent 365 license matching
+pwsh ./Get-Agent365ActiveUsers.ps1 `
+  -CopilotSkuPartNumbers 'MICROSOFT_365_COPILOT','E7' `
+  -CopilotSkuPartNumberPatterns '*MICROSOFT_365_COPILOT*','*E7*','*AGENT*','*COPILOT*'
 
-# override Agent 365 license matching (exact SKU part numbers + wildcard patterns)
-pwsh ./Get-Agent365ActiveUsers.ps1 \
-  -CopilotSkuPartNumbers "MICROSOFT_365_COPILOT","E7" \
-  -CopilotSkuPartNumberPatterns "*MICROSOFT_365_COPILOT*","*E7*","*AGENT*","*COPILOT*"
+# raw JSON output (no HTML, no console tables)
+pwsh ./Get-Agent365ActiveUsers.ps1 -ReturnRaw
 ```
 
-## Notes
+## Outputs
 
-- Licensed/unlicensed classification is based on configured Agent 365 SKU part numbers and each user's assigned licenses.
-- Active-user identity list is built from Unified Audit Log operations configured in the script parameters.
+- `Agent365-ActiveUsers-Report.html` — tabbed HTML report (summary cards + licensed/unlicensed tables + assumptions).
+- `Agent365-ActiveUsers.log` — execution log with timestamps.
+
+Both files are ignored by `.gitignore` and never committed.
+
+## Notes and caveats
+
+- Licensed/unlicensed classification depends entirely on the configured SKU part numbers and patterns matching a SKU in your tenant. If no SKUs match, the run stops with an error.
+- The active-user identity list comes from the Unified Audit Log; tenants that log different operation names should override `-AuditOperations`.
+- Summary metrics come from Microsoft Graph Copilot reports; user detail lists come from audit records plus Graph user lookups. Timing/latency between sources can produce minor discrepancies.
+- Results depend on Unified Audit Log retention and on the permissions of the signed-in account.
+
+## Development
+
+A GitHub Actions workflow at `.github/workflows/lint-powershell.yml` runs [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) on every push and pull request that touches a `*.ps1` file.
