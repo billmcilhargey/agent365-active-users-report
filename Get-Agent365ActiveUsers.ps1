@@ -31,22 +31,12 @@ param(
 
     [switch]$UseDeviceCode,
 
-    # Opt in to pulling per-user CopilotInteraction records from the Unified
-    # Audit Log via Exchange Online PowerShell. UAL covers unlicensed Copilot
-    # Chat activity that the Microsoft Graph user-detail report does not
-    # report, but Search-UnifiedAuditLog / Connect-IPPSSession only work on
-    # Windows PowerShell 7. When this switch is off (default), the script
-    # builds the active-user list from Microsoft Graph alone, which works on
-    # Linux/macOS as well as Windows.
+    # Opt in to the Unified Audit Log (Exchange Online PowerShell, Windows-only).
+    # Required to surface unlicensed Copilot Chat activity not in the Graph report.
     [switch]$IncludeUnifiedAuditLog,
 
-    # Skip the pre-flight Microsoft Entra directory-role check. By default
-    # the script enumerates the signed-in account's directory roles via
-    # /me/transitiveMemberOf and warns when none of the qualifying roles
-    # for getMicrosoft365CopilotUsageUserDetail are present. Use this
-    # switch if the role lookup itself fails (e.g. missing scope) or if
-    # access is granted via a custom directory role the check does not
-    # recognise.
+    # Skip the Microsoft Entra directory-role pre-check (use for custom roles
+    # the check does not recognise; see README "Required permissions").
     [switch]$SkipRoleCheck
 )
 
@@ -65,6 +55,60 @@ $script:LogFullPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $L
 $script:userDetailLikelyForbidden = $false
 $script:userDetailSkipReason      = $null
 
+# Collector of report steps that were intentionally skipped, so the console
+# summary and HTML report can show [SKIPPED] in place of misleading 0
+# values and explain WHY in a dedicated notes section. Populated via
+# Add-SkippedItem from the pre-check, main flow, and UAL paths.
+$script:SkippedItems = New-Object System.Collections.Generic.List[object]
+
+function Add-SkippedItem {
+    <#
+    .SYNOPSIS
+        Record a report step that was intentionally skipped, with a
+        human-readable reason for later display in the console summary and
+        the HTML notes section.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Item,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+
+        [string]$Remediation
+    )
+
+    # De-duplicate by Item so the same step is not recorded twice when
+    # multiple code paths flag the same skip (e.g. pre-check then 403 catch).
+    foreach ($existing in $script:SkippedItems) {
+        if ($existing.Item -eq $Item) { return }
+    }
+
+    $script:SkippedItems.Add([pscustomobject]@{
+        Item        = $Item
+        Reason      = $Reason
+        Remediation = $Remediation
+    })
+}
+
+function Format-CountOrSkipped {
+    <#
+    .SYNOPSIS
+        Return the numeric Count as a string, OR the literal token
+        "[SKIPPED]" when the upstream step that would have produced data
+        was skipped. Used by console summary and HTML stat tiles to avoid
+        showing a misleading 0 when the real answer is "we could not check".
+    #>
+    param(
+        [int]$Count,
+        [bool]$WasSkipped
+    )
+
+    if ($WasSkipped) { return '[SKIPPED]' }
+    return [string]$Count
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)]
@@ -76,7 +120,28 @@ function Write-Log {
     $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $line = "[$ts] [$Level] $Message"
     Add-Content -Path $script:LogFullPath -Value $line
-    Write-Host $line
+
+    # Console output: keep the timestamp neutral and color the [LEVEL] tag so
+    # INFO / WARN / ERROR stand out at a glance. Falls back to a plain
+    # Write-Host if the host doesn't support color (e.g. redirected stdout).
+    $levelColor = switch ($Level) {
+        'INFO'  { 'Cyan' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { $null }
+    }
+
+    try {
+        Write-Host "[$ts] " -NoNewline
+        if ($levelColor) {
+            Write-Host "[$Level]" -NoNewline -ForegroundColor $levelColor
+        } else {
+            Write-Host "[$Level]" -NoNewline
+        }
+        Write-Host " $Message"
+    } catch {
+        Write-Host $line
+    }
 }
 
 function Write-VerboseLog {
@@ -116,6 +181,11 @@ if (Test-Path -LiteralPath $script:LogFullPath) {
     }
 }
 
+# Clear the console on interactive runs so the report output starts on a
+# fresh screen. Wrapped because Clear-Host can throw when the script is
+# executed in a non-interactive host (CI runners, redirected stdout, etc.).
+try { Clear-Host } catch { Write-Verbose "Clear-Host skipped: $($_.Exception.Message)" }
+
 Write-Log -Message ("=" * 72)
 Write-Log -Message "Agent 365 Active Users Report v$script:ScriptVersion"
 Write-Log -Message "Run started: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))"
@@ -134,10 +204,7 @@ function Initialize-RequiredModule {
     if (-not (Get-Module -ListAvailable -Name $Name)) {
         Write-Log -Message "Installing module: $Name"
         Write-Host "Installing module: $Name"
-        # PowerShellGet emits noisy WARNING lines about PackageManagement /
-        # PowerShellGet being "currently in use" when it can't refresh its own
-        # bootstrap helpers. Those warnings are harmless for third-party module
-        # installs, so suppress them here to keep the run output clean.
+        # Suppress harmless PowerShellGet bootstrap warnings for cleaner output.
         Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber -WarningAction SilentlyContinue
     }
 
@@ -170,7 +237,7 @@ function Invoke-Agent365Preflight {
     $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
     Write-Log -Message "Platform: $platformName"
 
-    Write-Log -Message "Report period: $Period"
+    Write-Log -Message "Report period: $Period ($(Get-PeriodDescription -PeriodValue $Period))"
     Write-Log -Message 'Primary active-user source: Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
 
     if ($IncludeUnifiedAuditLog) {
@@ -221,6 +288,72 @@ function Get-PeriodDays {
         'ALL' { return 180 }
         default { return 30 }
     }
+}
+
+function Get-PeriodDescription {
+    <#
+    .SYNOPSIS
+        Render a human-friendly description for a Microsoft Graph reporting
+        period code (e.g. D30 -> "trailing 30 days (2026-04-18 -> 2026-05-17)").
+
+    .DESCRIPTION
+        Microsoft Graph usage reports accept period codes D7, D30, D90, D180,
+        and ALL. The codes alone are opaque to anyone reading the report, so
+        this helper turns them into a short phrase that also includes the
+        actual date window when a report refresh date is supplied.
+
+        Window math follows the same convention as the Graph reports: the
+        period is INCLUSIVE of the refresh date. For example, D30 with a
+        refresh date of 2026-05-17 covers 2026-04-18 through 2026-05-17 (30
+        calendar days inclusive on both ends).
+
+    .PARAMETER PeriodValue
+        Period code: D7, D30, D90, D180, or ALL.
+
+    .PARAMETER ReportRefreshDate
+        Optional. The Report Refresh Date string from the Graph summary
+        response (yyyy-MM-dd). When supplied, the description includes the
+        concrete date window. When omitted, only the trailing-day phrase is
+        returned.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PeriodValue,
+
+        [string]$ReportRefreshDate
+    )
+
+    $base = switch ($PeriodValue) {
+        'D7'   { 'trailing 7 days' }
+        'D30'  { 'trailing 30 days' }
+        'D90'  { 'trailing 90 days' }
+        'D180' { 'trailing 180 days' }
+        'ALL'  { 'all available history (up to last 180 days)' }
+        default { "trailing $PeriodValue" }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ReportRefreshDate)) {
+        return $base
+    }
+
+    $end = $null
+    try {
+        $end = [datetime]::ParseExact($ReportRefreshDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        try { $end = [datetime]$ReportRefreshDate } catch { $end = $null }
+    }
+    if (-not $end) { return $base }
+
+    $days = Get-PeriodDays -PeriodValue $PeriodValue
+    if ($PeriodValue -eq 'ALL') {
+        return "$base (through $($end.ToString('yyyy-MM-dd')))"
+    }
+
+    # Window is inclusive on both ends: refresh date counts as day N, so the
+    # start is (days - 1) days earlier (e.g. D30 ending 2026-05-17 starts
+    # 2026-04-18 -- 30 calendar days inclusive).
+    $start = $end.AddDays(-($days - 1))
+    return "$base ($($start.ToString('yyyy-MM-dd')) -> $($end.ToString('yyyy-MM-dd')))"
 }
 
 function Get-TenantContextInfo {
@@ -996,6 +1129,7 @@ function ConvertTo-Agent365ActiveUserCandidate {
     param(
         [Parameter(Mandatory = $true)]
         [AllowNull()]
+        [AllowEmptyCollection()]
         [object[]]$UserDetailRecords
     )
 
@@ -1210,9 +1344,14 @@ function Get-ActiveUserLicenseClassification {
 
     Write-Log -Message "Classified users. Licensed: $($licensed.Count), Unlicensed: $($unlicensed.Count)"
 
+    # Convert List[object] to plain arrays before returning. PowerShell 7.6.x
+    # has a bug where @($psObj.SomeProperty) throws
+    # "OperationStopped: Argument types do not match" when the property holds
+    # an empty System.Collections.Generic.List[object]. Returning arrays
+    # sidesteps the bug entirely for every caller.
     return [PSCustomObject]@{
-        Licensed   = $licensed
-        Unlicensed = $unlicensed
+        Licensed   = $licensed.ToArray()
+        Unlicensed = $unlicensed.ToArray()
     }
 }
 
@@ -1291,6 +1430,11 @@ function New-Agent365HtmlReport {
     $accountHtml       = & $encode $TenantInfo.Account       'Unknown'
     $scriptVersionHtml = & $encode $TenantInfo.ScriptVersion '0.0.0'
 
+    # Human-readable period description (e.g. "trailing 30 days (2026-04-18
+    # -> 2026-05-17)") so readers don't have to know what "D30" means.
+    $periodDescription = Get-PeriodDescription -PeriodValue $Summary.Period -ReportRefreshDate $Summary.ReportRefreshDate
+    $periodHtml = & $encode "$($Summary.Period) - $periodDescription" $Summary.Period
+
     # Build an in-report warning banner when the per-user Graph call was
     # skipped or returned 403 Forbidden. Without this the user might not
     # realise the empty Licensed/Unlicensed tables are due to permissions
@@ -1307,6 +1451,38 @@ function New-Agent365HtmlReport {
                 <ul>
                     <li>Assign <code>Reports Reader</code> (least privilege, read-only) or a higher admin role (Global Admin, AI Admin, Exchange / SharePoint / Teams admin) to the signed-in account in the Microsoft Entra admin center.</li>
                     <li>Run <code>Disconnect-MgGraph</code> and re-run this script to refresh the token.</li>
+                </ul>
+            </div>
+"@
+    }
+
+    # Build the [SKIPPED] tokens for the top stat tiles so empty Licensed /
+    # Unlicensed values don't masquerade as "zero activity" when the real
+    # reason is that we never received per-user data.
+    $userDetailSkipped     = ($DataSources.PSObject.Properties.Name -contains 'GraphUserDetailUnavailable') -and [bool]$DataSources.GraphUserDetailUnavailable
+    $licensedTotalDisplay   = & $encode (Format-CountOrSkipped -Count $LicensedUsers.Count   -WasSkipped $userDetailSkipped) '0'
+    $unlicensedTotalDisplay = & $encode (Format-CountOrSkipped -Count $UnlicensedUsers.Count -WasSkipped $userDetailSkipped) '0'
+
+    # Render a per-step "Skipped steps" section inside the Notes block so the
+    # HTML report explains WHY any value rendered as [SKIPPED] above. Kept
+    # empty when nothing was skipped.
+    $skippedNotesHtml = ''
+    if (($DataSources.PSObject.Properties.Name -contains 'SkippedItems') -and @($DataSources.SkippedItems).Count -gt 0) {
+        $skippedListItems = foreach ($s in $DataSources.SkippedItems) {
+            $itemHtml        = & $encode $s.Item        'Unknown step'
+            $reasonHtml      = & $encode $s.Reason      'Not recorded'
+            $remediationHtml = ''
+            if ($s.PSObject.Properties.Name -contains 'Remediation' -and -not [string]::IsNullOrWhiteSpace([string]$s.Remediation)) {
+                $remediationHtml = '<br/><em>Remediation:</em> ' + (& $encode $s.Remediation '')
+            }
+            "                        <li><strong>$itemHtml</strong> &mdash; $reasonHtml$remediationHtml</li>"
+        }
+        $skippedNotesHtml = @"
+            <div class="notes" id="skipped-steps">
+                <h2>Skipped steps</h2>
+                <p>The following report steps were skipped. Values above shown as <code>[SKIPPED]</code> are a consequence of these skips, <em>not</em> a true zero.</p>
+                <ul>
+$($skippedListItems -join [Environment]::NewLine)
                 </ul>
             </div>
 "@
@@ -1432,14 +1608,14 @@ function New-Agent365HtmlReport {
     <main class="container" id="top">
         <div class="panel">
             <h1>Agent 365 Active Users Report</h1>
-            <div class="meta">Generated UTC: $generatedUtc &middot; Period: $($Summary.Period) &middot; Report Refresh Date: $($Summary.ReportRefreshDate)</div>
+            <div class="meta">Generated UTC: $generatedUtc &middot; Period: $periodHtml &middot; Report Refresh Date: $($Summary.ReportRefreshDate)</div>
 $userDetailBannerHtml
             <div class="stats">
                 <div class="stat"><div class="k">Agent 365 Active Users</div><div class="v">$($Summary.ActiveUsers)</div></div>
                 <div class="stat"><div class="k">Enabled Users</div><div class="v">$($Summary.EnabledUsers)</div></div>
                 <div class="stat"><div class="k">Copilot Chat Active Users</div><div class="v">$($Summary.CopilotChatActiveUsers)</div></div>
-                <div class="stat"><div class="k">Active Licensed Users Total</div><div class="v">$($LicensedUsers.Count)</div></div>
-                <div class="stat"><div class="k">Active Unlicensed Users Total</div><div class="v">$($UnlicensedUsers.Count)</div></div>
+                <div class="stat"><div class="k">Active Licensed Users Total</div><div class="v">$licensedTotalDisplay</div></div>
+                <div class="stat"><div class="k">Active Unlicensed Users Total</div><div class="v">$unlicensedTotalDisplay</div></div>
             </div>
 
             <div class="tabs">
@@ -1480,6 +1656,7 @@ $unlicensedRows
                     <li>Report accuracy depends on Graph reporting latency (typically 24–48 hours), license assignment freshness, and your tenant’s Reports.Read.All / User.Read.All permissions.</li>
                 </ul>
             </div>
+$skippedNotesHtml
         </div>
     </main>
 
@@ -1561,7 +1738,13 @@ function Get-UserTableProjection {
                 [object[]]$Users
         )
 
-        return $Users | Select-Object UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
+        # Use the unary comma operator on the local variable so the function
+        # always returns an actual array (even empty) instead of letting
+        # PowerShell unwrap an empty pipeline to $null. Without this,
+        # $licensedTableUsers.Count under Set-StrictMode throws
+        # "The property 'Count' cannot be found on this object".
+        $projected = @($Users | Select-Object UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source)
+        return ,$projected
 }
 
 $scopes = @('Reports.Read.All', 'User.Read.All', 'Organization.Read.All')
@@ -1622,6 +1805,7 @@ if ($SkipRoleCheck) {
         Write-Log -Level 'WARN' -Message '  Skipping per-user detail call. The report will still be generated from Graph summary metrics + license data; the Licensed/Unlicensed active-user tables will be empty.'
         $script:userDetailLikelyForbidden = $true
         $script:userDetailSkipReason = ('Signed-in account ({0}) holds only tenant-level role(s): {1}. Microsoft restricts these roles to aggregate data only.' -f $upn, ($roleCheck.TenantOnlyRoles -join ', '))
+        Add-SkippedItem -Item 'Per-user Copilot activity (Graph getMicrosoft365CopilotUsageUserDetail)' -Reason $script:userDetailSkipReason -Remediation 'In the Microsoft Entra admin center, assign Reports Reader (least privilege, read-only) IN ADDITION to the current role, then run Disconnect-MgGraph and re-run this script.'
     } else {
         $upn = $roleCheck.UserPrincipalName
         if (-not $upn) { $upn = '<unknown>' }
@@ -1636,6 +1820,7 @@ if ($SkipRoleCheck) {
         Write-Log -Level 'WARN' -Message '  If access is granted via a custom directory role the check does not recognise, re-run with -SkipRoleCheck to suppress this warning and attempt the call anyway.'
         $script:userDetailLikelyForbidden = $true
         $script:userDetailSkipReason = ('Signed-in account ({0}) holds no directory role that qualifies for the per-user Copilot usage report. Assigned roles: {1}.' -f $upn, $assignedText)
+        Add-SkippedItem -Item 'Per-user Copilot activity (Graph getMicrosoft365CopilotUsageUserDetail)' -Reason $script:userDetailSkipReason -Remediation 'In the Microsoft Entra admin center, assign Reports Reader (least privilege) to this account, then run Disconnect-MgGraph and re-run this script.'
     }
 }
 
@@ -1696,13 +1881,17 @@ if ($script:userDetailLikelyForbidden) {
             $userDetailRecords       = @()
             $userDetailUnavailable   = $true
             $userDetailFailureReason = '403 Forbidden from Microsoft Graph getMicrosoft365CopilotUsageUserDetail. The signed-in account does not have sufficient permissions to read per-user Copilot activity.'
+            Add-SkippedItem -Item 'Per-user Copilot activity (Graph getMicrosoft365CopilotUsageUserDetail)' -Reason $userDetailFailureReason -Remediation 'Assign Reports Reader (or higher admin role such as Global Administrator / AI Administrator) to this account, then run Disconnect-MgGraph and re-run this script.'
         } else {
             throw
         }
     }
 }
 
-$graphCandidates = ConvertTo-Agent365ActiveUserCandidate -UserDetailRecords $userDetailRecords
+# Wrap in @(...) so an empty result from the function is preserved as an
+# empty array rather than being unwrapped to $null (which would break
+# .Count under Set-StrictMode).
+$graphCandidates = @(ConvertTo-Agent365ActiveUserCandidate -UserDetailRecords $userDetailRecords)
 if ($userDetailUnavailable) {
     Write-Log -Level 'WARN' -Message 'No per-user Graph activity available; Licensed/Unlicensed active-user tables will be empty unless UAL is enabled.'
 } else {
@@ -1718,6 +1907,7 @@ if ($IncludeUnifiedAuditLog) {
     if (-not $IsWindows) {
         $ualSkippedReason = 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. Skipped on this platform.'
         Write-Log -Level 'WARN' -Message $ualSkippedReason
+        Add-SkippedItem -Item 'Unified Audit Log (CopilotInteraction)' -Reason $ualSkippedReason -Remediation 'Re-run this script on Windows PowerShell 7 with the ExchangeOnlineManagement module installed.'
     } else {
         Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from Unified Audit Log'
         Write-Log -Message 'Collecting active users from Unified Audit Log.'
@@ -1729,8 +1919,10 @@ if ($IncludeUnifiedAuditLog) {
 }
 $script:StepId++
 
-$mergedCandidates = Merge-Agent365ActiveUserCandidates -GraphCandidates $graphCandidates -AuditCandidates $auditCandidates
-Write-Log -Message "Merged candidate count after dedup: $($mergedCandidates.Count)."
+# Wrap in @(...) so an empty merge result is preserved as an empty array
+# rather than being unwrapped to $null under Set-StrictMode.
+$mergedCandidates = @(Merge-Agent365ActiveUserCandidates -GraphCandidates $graphCandidates -AuditCandidates $auditCandidates)
+Write-Log -Message ("Merged candidate count after dedup: {0}." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Resolving Agent 365 SKUs'
 Write-Log -Message 'Resolving Agent 365 SKU IDs from subscribed SKUs.'
@@ -1740,7 +1932,7 @@ $matchedSkuPartNumbers = @($skuMatchResults.MatchedSkuPartNumbers)
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Classifying licensed vs unlicensed users'
-Write-Log -Message "Classifying $($mergedCandidates.Count) active users by license assignment."
+Write-Log -Message ("Classifying {0} active users by license assignment." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
 $classification = Get-ActiveUserLicenseClassification -ActiveUsers $mergedCandidates -CopilotSkuIds $copilotSkuIds
 $script:StepId++
 
@@ -1772,6 +1964,7 @@ $dataSources = [PSCustomObject]@{
     MergedCandidates           = $mergedCandidates.Count
     AuditOperations            = $AuditOperations
     UalNoteHtml                = $ualNoteHtml
+    SkippedItems               = @($script:SkippedItems)
 }
 
 if ($ReturnRaw) {
@@ -1796,15 +1989,15 @@ if ($ReturnRaw) {
     return
 }
 
-Write-Host "Agent 365 Active Users (Period: $Period): $($result.ActiveUsers)"
+Write-Host "Agent 365 Active Users (Period: $Period - $(Get-PeriodDescription -PeriodValue $Period -ReportRefreshDate $result.ReportRefreshDate)): $($result.ActiveUsers)"
 Write-Host "Report Refresh Date: $($result.ReportRefreshDate)"
 Write-Host "Enabled Users: $($result.EnabledUsers)"
 Write-Host "Copilot Chat Active Users: $($result.CopilotChatActiveUsers)"
 Write-Host "Agent 365 SKU exact matches configured: $($CopilotSkuPartNumbers -join ', ')"
 Write-Host "Agent 365 SKU pattern matches configured: $($CopilotSkuPartNumberPatterns -join ', ')"
 Write-Host "Agent 365 SKUs matched in tenant: $($matchedSkuPartNumbers -join ', ')"
-Write-Host "Active Licensed Users Total: $($licensedTableUsers.Count)"
-Write-Host "Active Unlicensed Users Total: $($unlicensedTableUsers.Count)"
+Write-Host ("Active Licensed Users Total: {0}" -f (Format-CountOrSkipped -Count $licensedTableUsers.Count -WasSkipped $dataSources.GraphUserDetailUnavailable))
+Write-Host ("Active Unlicensed Users Total: {0}" -f (Format-CountOrSkipped -Count $unlicensedTableUsers.Count -WasSkipped $dataSources.GraphUserDetailUnavailable))
 if ($dataSources.GraphUserDetailUnavailable) {
     Write-Host "Graph user-detail rows: UNAVAILABLE (per-user call skipped or returned 403 Forbidden)"
     Write-Host "  Reason: $($dataSources.GraphUserDetailReason)"
@@ -1848,6 +2041,20 @@ if ($unlicensedTableUsers.Count -gt 0) {
     $unlicensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
 } else {
     Write-Host 'No unlicensed active users found.'
+}
+
+# Skipped-steps summary: explain WHY any value above shows [SKIPPED] or
+# UNAVAILABLE, and what the user can do about it.
+if ($script:SkippedItems.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'Skipped steps (values shown as [SKIPPED] above):' -ForegroundColor Yellow
+    foreach ($s in $script:SkippedItems) {
+        Write-Host ("  - {0}" -f $s.Item) -ForegroundColor Yellow
+        Write-Host ("      Reason     : {0}" -f $s.Reason)
+        if ($s.Remediation) {
+            Write-Host ("      Remediation: {0}" -f $s.Remediation)
+        }
+    }
 }
 
 $script:StepId++

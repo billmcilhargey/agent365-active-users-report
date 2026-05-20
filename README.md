@@ -130,7 +130,7 @@ The **Source** column in the HTML report indicates which path produced each row.
 - `Agent365-ActiveUsers-Report.html` — tabbed HTML report (summary cards + licensed/unlicensed tables + Last Activity Date + Source + assumptions).
 - `Agent365-ActiveUsers.log` — execution log with timestamps. **Recreated on every run** so the log only ever reflects the latest invocation.
 
-Both files are ignored by `.gitignore` and never committed.
+Both files are ignored by `.gitignore` and never committed. The log and HTML report contain tenant-specific identifiers (user principal names, SKU part numbers, tenant display name) — review and redact before sharing externally.
 
 ## Notes and caveats
 

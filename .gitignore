@@ -1,12 +1,20 @@
 # Logs and generated runtime artifacts
 *.log
+./logs/
 
 # Generated reports
 *.html
+./reports/
+
+# Stray CSV exports (e.g. ad-hoc Graph data captures)
+*.csv
 
 # PowerShell temporary files and IDE noise
 *.tmp
 *.bak
+*.swp
+*.code-workspace
+.vscode/
 
 # OS files
 .DS_Store
