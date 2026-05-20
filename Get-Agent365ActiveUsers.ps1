@@ -47,6 +47,7 @@ $script:StepId = 1
 $script:TotalSteps = 9
 $script:ScriptVersion = '1.0.0'
 $script:LogFullPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $LogPath))
+$script:ReportFullPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $ReportPath))
 
 # Set by the directory-role pre-check (see Test-Agent365ReportsAccess) when
 # the signed-in account is known to lack a role that qualifies for the
@@ -113,7 +114,7 @@ function Write-Log {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
         [string]$Level = 'INFO'
     )
 
@@ -125,10 +126,11 @@ function Write-Log {
     # INFO / WARN / ERROR stand out at a glance. Falls back to a plain
     # Write-Host if the host doesn't support color (e.g. redirected stdout).
     $levelColor = switch ($Level) {
-        'INFO'  { 'Cyan' }
-        'WARN'  { 'Yellow' }
-        'ERROR' { 'Red' }
-        default { $null }
+        'INFO'    { 'Cyan' }
+        'WARN'    { 'Yellow' }
+        'ERROR'   { 'Red' }
+        'SUCCESS' { 'Green' }
+        default   { $null }
     }
 
     try {
@@ -181,6 +183,15 @@ if (Test-Path -LiteralPath $script:LogFullPath) {
     }
 }
 
+# Always start with a fresh HTML report so each run reflects only the latest data.
+if (Test-Path -LiteralPath $script:ReportFullPath) {
+    try {
+        Remove-Item -LiteralPath $script:ReportFullPath -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not remove existing report file '$script:ReportFullPath': $($_.Exception.Message). It will be overwritten when the new report is written."
+    }
+}
+
 # Clear the console on interactive runs so the report output starts on a
 # fresh screen. Wrapped because Clear-Host can throw when the script is
 # executed in a non-interactive host (CI runners, redirected stdout, etc.).
@@ -211,68 +222,6 @@ function Initialize-RequiredModule {
     Import-Module $Name -ErrorAction Stop
     Write-Log -Message "Module loaded: $Name"
 }
-
-function Invoke-Agent365Preflight {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Period,
-        [Parameter(Mandatory = $true)]
-        [string[]]$RequiredModules,
-        [Parameter(Mandatory = $true)]
-        [string[]]$AuditOperations,
-        [switch]$IncludeUnifiedAuditLog
-    )
-
-    Write-Log -Message ('-' * 72)
-    Write-Log -Message 'Pre-flight checks'
-    Write-Log -Message ('-' * 72)
-
-    $psv = $PSVersionTable.PSVersion
-    Write-Log -Message "PowerShell version: $psv ($($PSVersionTable.PSEdition))"
-    if ($psv.Major -lt 7) {
-        Write-Log -Level 'WARN' -Message "PowerShell 7+ is recommended. Running on $psv."
-    }
-
-    $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
-    Write-Log -Message "Platform: $platformName"
-
-    Write-Log -Message "Report period: $Period ($(Get-PeriodDescription -PeriodValue $Period))"
-    Write-Log -Message 'Primary active-user source: Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
-
-    if ($IncludeUnifiedAuditLog) {
-        if ($AuditOperations -and $AuditOperations.Count -gt 0) {
-            Write-Log -Message "Unified Audit Log operations: $($AuditOperations -join ', ')"
-        } else {
-            Write-Log -Level 'WARN' -Message 'IncludeUnifiedAuditLog is set but -AuditOperations is empty; UAL step will be skipped.'
-        }
-        if (-not $IsWindows) {
-            Write-Log -Level 'WARN' -Message 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. On this platform the UAL step will be skipped and the report will use Graph data only.'
-        }
-    } else {
-        Write-Log -Message 'Unified Audit Log step: disabled (pass -IncludeUnifiedAuditLog to enable on Windows).'
-    }
-
-    Write-Log -Message "Installing/loading required modules: $($RequiredModules -join ', ')"
-    foreach ($m in $RequiredModules) {
-        Initialize-RequiredModule -Name $m
-    }
-
-    Write-Log -Message 'Pre-flight checks complete. Proceeding to authentication.'
-    Write-Log -Message ('-' * 72)
-}
-
-$preflightModules = [System.Collections.Generic.List[string]]::new()
-$preflightModules.Add('Microsoft.Graph.Authentication')
-if ($IncludeUnifiedAuditLog -and $IsWindows) {
-    $preflightModules.Add('ExchangeOnlineManagement')
-}
-
-Invoke-Agent365Preflight `
-    -Period $Period `
-    -RequiredModules $preflightModules.ToArray() `
-    -AuditOperations $AuditOperations `
-    -IncludeUnifiedAuditLog:$IncludeUnifiedAuditLog
 
 function Get-PeriodDays {
     param(
@@ -355,6 +304,68 @@ function Get-PeriodDescription {
     $start = $end.AddDays(-($days - 1))
     return "$base ($($start.ToString('yyyy-MM-dd')) -> $($end.ToString('yyyy-MM-dd')))"
 }
+
+function Invoke-Agent365Preflight {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Period,
+        [Parameter(Mandatory = $true)]
+        [string[]]$RequiredModules,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AuditOperations,
+        [switch]$IncludeUnifiedAuditLog
+    )
+
+    Write-Log -Message ('-' * 72)
+    Write-Log -Message 'Pre-flight checks'
+    Write-Log -Message ('-' * 72)
+
+    $psv = $PSVersionTable.PSVersion
+    Write-Log -Message "PowerShell version: $psv ($($PSVersionTable.PSEdition))"
+    if ($psv.Major -lt 7) {
+        Write-Log -Level 'WARN' -Message "PowerShell 7+ is recommended. Running on $psv."
+    }
+
+    $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
+    Write-Log -Message "Platform: $platformName"
+
+    Write-Log -Message "Report period: $Period ($(Get-PeriodDescription -PeriodValue $Period))"
+    Write-Log -Message 'Primary active-user source: Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
+
+    if ($IncludeUnifiedAuditLog) {
+        if ($AuditOperations -and $AuditOperations.Count -gt 0) {
+            Write-Log -Message "Unified Audit Log operations: $($AuditOperations -join ', ')"
+        } else {
+            Write-Log -Level 'WARN' -Message 'IncludeUnifiedAuditLog is set but -AuditOperations is empty; UAL step will be skipped.'
+        }
+        if (-not $IsWindows) {
+            Write-Log -Level 'WARN' -Message 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. On this platform the UAL step will be skipped and the report will use Graph data only.'
+        }
+    } else {
+        Write-Log -Message 'Unified Audit Log step: disabled (pass -IncludeUnifiedAuditLog to enable on Windows).'
+    }
+
+    Write-Log -Message "Installing/loading required modules: $($RequiredModules -join ', ')"
+    foreach ($m in $RequiredModules) {
+        Initialize-RequiredModule -Name $m
+    }
+
+    Write-Log -Message 'Pre-flight checks complete. Proceeding to authentication.'
+    Write-Log -Message ('-' * 72)
+}
+
+$preflightModules = [System.Collections.Generic.List[string]]::new()
+$preflightModules.Add('Microsoft.Graph.Authentication')
+if ($IncludeUnifiedAuditLog -and $IsWindows) {
+    $preflightModules.Add('ExchangeOnlineManagement')
+}
+
+Invoke-Agent365Preflight `
+    -Period $Period `
+    -RequiredModules $preflightModules.ToArray() `
+    -AuditOperations $AuditOperations `
+    -IncludeUnifiedAuditLog:$IncludeUnifiedAuditLog
 
 function Get-TenantContextInfo {
     [CmdletBinding()]
@@ -581,6 +592,38 @@ function Test-CanPromptOnStdin {
     try {
         return (-not [System.Console]::IsInputRedirected)
     } catch {
+        return $false
+    }
+}
+
+function Open-ReportInDefaultBrowser {
+    <#
+    .SYNOPSIS
+        Best-effort launch of the generated HTML report in the OS default
+        browser. No-op (returns $false) on headless / non-interactive hosts.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if (-not (Test-CanLaunchBrowser))        { return $false }
+
+    $full = [System.IO.Path]::GetFullPath($Path)
+    try {
+        if ($IsWindows) {
+            Start-Process -FilePath $full -ErrorAction Stop | Out-Null
+        } elseif ($IsMacOS) {
+            Start-Process -FilePath 'open' -ArgumentList $full -ErrorAction Stop | Out-Null
+        } else {
+            # Linux desktop
+            Start-Process -FilePath 'xdg-open' -ArgumentList $full -ErrorAction Stop | Out-Null
+        }
+        return $true
+    } catch {
+        Write-Verbose "Could not auto-launch browser: $($_.Exception.Message)"
         return $false
     }
 }
@@ -1932,7 +1975,7 @@ $matchedSkuPartNumbers = @($skuMatchResults.MatchedSkuPartNumbers)
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Classifying licensed vs unlicensed users'
-Write-Log -Message ("Classifying {0} active users by license assignment." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
+Write-Log -Message ("Classifying active users by license assignment (count: {0})." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
 $classification = Get-ActiveUserLicenseClassification -ActiveUsers $mergedCandidates -CopilotSkuIds $copilotSkuIds
 $script:StepId++
 
@@ -1964,7 +2007,9 @@ $dataSources = [PSCustomObject]@{
     MergedCandidates           = $mergedCandidates.Count
     AuditOperations            = $AuditOperations
     UalNoteHtml                = $ualNoteHtml
-    SkippedItems               = @($script:SkippedItems)
+    # PowerShell 7.6.x can throw "Argument types do not match" for @() over
+    # Generic.List[object] values in hashtable/object initializers; use ToArray().
+    SkippedItems               = $script:SkippedItems.ToArray()
 }
 
 if ($ReturnRaw) {
@@ -1999,30 +2044,32 @@ Write-Host "Agent 365 SKUs matched in tenant: $($matchedSkuPartNumbers -join ', 
 Write-Host ("Active Licensed Users Total: {0}" -f (Format-CountOrSkipped -Count $licensedTableUsers.Count -WasSkipped $dataSources.GraphUserDetailUnavailable))
 Write-Host ("Active Unlicensed Users Total: {0}" -f (Format-CountOrSkipped -Count $unlicensedTableUsers.Count -WasSkipped $dataSources.GraphUserDetailUnavailable))
 if ($dataSources.GraphUserDetailUnavailable) {
-    Write-Host "Graph user-detail rows: UNAVAILABLE (per-user call skipped or returned 403 Forbidden)"
+    Write-Host '[SKIPPED] Graph user-detail rows: per-user call skipped or returned 403 Forbidden.' -ForegroundColor Yellow
     Write-Host "  Reason: $($dataSources.GraphUserDetailReason)"
-    Write-Host "  Report still generated using Graph summary metrics + license data only."
+    Write-Host '  Report still generated using Graph summary metrics + license data only.'
 } else {
     Write-Host "Graph user-detail rows: $($dataSources.GraphCandidates)"
 }
 if ($dataSources.UalRequested) {
     if ($dataSources.UalSkippedReason) {
-        Write-Host "Unified Audit Log: skipped ($($dataSources.UalSkippedReason))"
+        Write-Host '[SKIPPED] Unified Audit Log was requested but could not be queried.' -ForegroundColor Yellow
+        Write-Host ("  Reason: {0}" -f $dataSources.UalSkippedReason)
     } else {
         Write-Host "Unified Audit Log unique users: $($dataSources.UalCandidates)"
     }
+} elseif (-not $IsWindows) {
+    Write-Host '[SKIPPED] Unified Audit Log is unavailable on this platform.' -ForegroundColor Yellow
+    Write-Host ("  Reason: Search-UnifiedAuditLog requires Exchange Online PowerShell, which is Windows-only in PowerShell 7. Detected platform: {0}." -f $(if ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'non-Windows' }))
 } else {
-    Write-Host 'Unified Audit Log: disabled (pass -IncludeUnifiedAuditLog on Windows to enable).'
+    Write-Host 'Unified Audit Log: disabled (pass -IncludeUnifiedAuditLog to enable).'
 }
 
 New-Agent365HtmlReport -OutputPath $ReportPath -Summary $result -LicensedUsers $licensedTableUsers -UnlicensedUsers $unlicensedTableUsers -MatchedSkuPartNumbers $matchedSkuPartNumbers -TenantInfo $tenantInfo -DataSources $dataSources
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Finalizing report output'
-Write-Log -Message "HTML report generated at: $([System.IO.Path]::GetFullPath((Join-Path (Get-Location) $ReportPath)))"
+Write-Log -Message "HTML report generated at: $script:ReportFullPath"
 
-Write-Host "Report generated: $(Resolve-Path $ReportPath)"
-Write-Host "Execution log: $script:LogFullPath"
 if ($VerboseLog) {
     Write-Host 'Verbose logging: enabled'
 }
@@ -2031,6 +2078,11 @@ Write-Host ''
 Write-Host 'Licensed Active Users (Agent 365):'
 if ($licensedTableUsers.Count -gt 0) {
     $licensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
+} elseif ($dataSources.GraphUserDetailUnavailable) {
+    Write-Host '[SKIPPED] Per-user data could not be retrieved.' -ForegroundColor Yellow
+    if ($dataSources.GraphUserDetailReason) {
+        Write-Host ("  Reason: {0}" -f $dataSources.GraphUserDetailReason)
+    }
 } else {
     Write-Host 'No licensed active users found.'
 }
@@ -2039,6 +2091,11 @@ Write-Host ''
 Write-Host 'Unlicensed Active Users (Agent 365):'
 if ($unlicensedTableUsers.Count -gt 0) {
     $unlicensedTableUsers | Sort-Object UserPrincipalName | Format-Table -AutoSize UserPrincipalName, DisplayName, ObjectId, LastActivityDate, Source
+} elseif ($dataSources.GraphUserDetailUnavailable) {
+    Write-Host '[SKIPPED] Per-user data could not be retrieved.' -ForegroundColor Yellow
+    if ($dataSources.GraphUserDetailReason) {
+        Write-Host ("  Reason: {0}" -f $dataSources.GraphUserDetailReason)
+    }
 } else {
     Write-Host 'No unlicensed active users found.'
 }
@@ -2062,4 +2119,19 @@ Update-StepProgress -Activity 'Agent 365 report' -Status 'Complete'
 if (-not $NoProgress) {
     Write-Progress -Activity 'Agent 365 report' -Completed
 }
-Write-Log -Message 'Run completed successfully.'
+
+# Final summary block: report path + execution log + best-effort browser launch.
+# Printed AFTER the Skipped-steps section so the user always sees "where the
+# output is" as the last thing on screen.
+Write-Host ''
+Write-Host ''
+if (Open-ReportInDefaultBrowser -Path $script:ReportFullPath) {
+    Write-Host "Opened report in default browser: $script:ReportFullPath" -ForegroundColor Green
+    Write-Log  -Level SUCCESS -Message "Opened report in default browser: $script:ReportFullPath"
+} else {
+    Write-Host "Report saved (open manually): $script:ReportFullPath" -ForegroundColor Green
+    Write-Log  -Message "Browser auto-launch skipped (headless/non-interactive host). Report path: $script:ReportFullPath"
+}
+Write-Host "Execution log: $script:LogFullPath" -ForegroundColor Green
+
+Write-Log -Level SUCCESS -Message 'Run completed successfully.'
