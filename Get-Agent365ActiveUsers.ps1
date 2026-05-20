@@ -43,6 +43,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell 5.1 does not define the automatic variables
+# $IsWindows / $IsLinux / $IsMacOS that the rest of the script (and
+# Set-StrictMode) expect. Define safe shims so platform checks below work
+# regardless of host. PowerShell 7+ already has these as read-only
+# automatic variables and will skip this block.
+if (-not (Get-Variable -Name 'IsWindows' -Scope Global -ErrorAction SilentlyContinue)) {
+    Set-Variable -Name 'IsWindows' -Value $true  -Scope Global -Option ReadOnly -Force
+    Set-Variable -Name 'IsLinux'   -Value $false -Scope Global -Option ReadOnly -Force
+    Set-Variable -Name 'IsMacOS'   -Value $false -Scope Global -Option ReadOnly -Force
+}
+
 $script:StepId = 1
 $script:TotalSteps = 9
 $script:ScriptVersion = '1.0.0'
@@ -325,6 +336,50 @@ function Invoke-Agent365Preflight {
     Write-Log -Message "PowerShell version: $psv ($($PSVersionTable.PSEdition))"
     if ($psv.Major -lt 7) {
         Write-Log -Level 'WARN' -Message "PowerShell 7+ is recommended. Running on $psv."
+
+        # Prompt the user to upgrade to PowerShell 7+. They can continue on
+        # 5.1 at their own risk (some features may not work).
+        $upgradeAnswer = $null
+        try {
+            $upgradeAnswer = Read-Host -Prompt 'Upgrade to PowerShell 7+ recommended. Open the install page and exit now? [Y/N]'
+        } catch {
+            Write-Log -Level 'WARN' -Message "Could not prompt for upgrade decision: $($_.Exception.Message). Continuing on PowerShell $psv."
+        }
+        if ($upgradeAnswer -and $upgradeAnswer.Trim().ToUpperInvariant() -in @('Y', 'YES')) {
+            Write-Log -Message 'User chose to upgrade. Installing PowerShell 7 via winget per https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget.'
+
+            $winget = Get-Command -Name 'winget' -ErrorAction SilentlyContinue
+            if (-not $winget) {
+                Write-Log -Level 'ERROR' -Message 'winget was not found on PATH. Install App Installer from the Microsoft Store, or download PowerShell 7 manually.'
+                try { Start-Process 'https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget' | Out-Null } catch { }
+                exit 1
+            }
+
+            # Step 1: search winget for available PowerShell packages so the
+            # user sees what is being offered (matches the docs walk-through).
+            Write-Log -Message 'Running: winget search Microsoft.PowerShell'
+            & winget search Microsoft.PowerShell
+
+            # Step 2: install the stable PowerShell 7 package.
+            # --id ensures an exact match; --source winget pins the source;
+            # --accept-source-agreements / --accept-package-agreements make
+            # the install non-interactive so the script can complete.
+            Write-Log -Message 'Running: winget install --id Microsoft.PowerShell --source winget'
+            & winget install --id Microsoft.PowerShell --source winget --accept-source-agreements --accept-package-agreements
+            $wingetExit = $LASTEXITCODE
+
+            if ($wingetExit -eq 0) {
+                Write-Log -Level 'SUCCESS' -Message 'PowerShell 7 installation completed.'
+            } else {
+                Write-Log -Level 'WARN' -Message "winget exited with code $wingetExit. Review the output above for details."
+            }
+
+            Write-Host ''
+            Write-Host 'Open a NEW terminal (so PATH refreshes) and re-run this script with:' -ForegroundColor Yellow
+            Write-Host '    pwsh -File .\Get-Agent365ActiveUsers.ps1' -ForegroundColor Yellow
+            exit $wingetExit
+        }
+        Write-Log -Message "Continuing on PowerShell $psv at user's request."
     }
 
     $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
@@ -699,6 +754,62 @@ function Connect-Agent365Graph {
         [switch]$UseDeviceCode
     )
 
+    # Inspect any cached Graph session and ask the user whether to reuse
+    # that account or sign in as a different one. We never silently assume
+    # the cached identity is the one the operator wants — wrong-account
+    # sign-ins are the most common cause of 403 errors on this report.
+    $existingCtx = $null
+    try { $existingCtx = Get-MgContext } catch { $existingCtx = $null }
+
+    $loginHint = $null
+    $forceDisconnect = $false
+
+    if ($existingCtx -and $existingCtx.Account) {
+        Write-Host ''
+        Write-Host ("A Microsoft Graph session is already cached for: {0}" -f $existingCtx.Account) -ForegroundColor Cyan
+        $reuse = $null
+        try {
+            $reuse = Read-Host -Prompt 'Use this account? [Y] Yes  [N] Sign in as a different account'
+        } catch {
+            Write-Log -Level 'WARN' -Message "Could not prompt for account selection: $($_.Exception.Message). Reusing cached account $($existingCtx.Account)."
+            $reuse = 'Y'
+        }
+        if ($reuse -and $reuse.Trim().ToUpperInvariant() -in @('N', 'NO')) {
+            $forceDisconnect = $true
+            Write-Log -Message "User chose to sign in with a different account; clearing cached session ($($existingCtx.Account))."
+        } else {
+            Write-Log -Message "Reusing cached Microsoft Graph account: $($existingCtx.Account)."
+        }
+    } else {
+        Write-Host ''
+        Write-Host 'No cached Microsoft Graph session found.' -ForegroundColor Cyan
+    }
+
+    if (-not $existingCtx -or $forceDisconnect) {
+        # Ask which account the operator wants to use. The value is used as
+        # a login hint so the browser / device-code flow lands on the right
+        # account picker entry; leaving it blank shows the full picker.
+        $accountInput = $null
+        try {
+            $accountInput = Read-Host -Prompt 'Enter the user principal name (email) of the account to sign in with, or press Enter to choose from the account picker'
+        } catch {
+            Write-Log -Level 'WARN' -Message "Could not prompt for account UPN: $($_.Exception.Message). Continuing without a login hint."
+        }
+        if ($accountInput) {
+            $loginHint = $accountInput.Trim()
+            if ($loginHint) {
+                Write-Log -Message "User-selected sign-in account: $loginHint"
+            }
+        }
+
+        if ($forceDisconnect) {
+            try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose "Disconnect-MgGraph cleanup ignored: $($_.Exception.Message)" }
+        }
+    } else {
+        # Reusing cached context — nothing more to do; Connect-MgGraph below
+        # will short-circuit on the existing token.
+    }
+
     $useDevice = $UseDeviceCode.IsPresent
     if ($useDevice) {
         Write-Log -Message 'Device code authentication requested for Microsoft Graph.'
@@ -709,17 +820,35 @@ function Connect-Agent365Graph {
 
     if ($useDevice) {
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
+        if ($loginHint) {
+            Write-Host ("When prompted on https://login.microsoft.com/device, sign in as: {0}" -f $loginHint) -ForegroundColor Yellow
+        }
         Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes
         return
     }
 
     try {
         Write-Log -Message 'Attempting interactive (browser) Microsoft Graph sign-in.'
+        if ($loginHint) {
+            Write-Host ("In the browser account picker, select: {0}" -f $loginHint) -ForegroundColor Yellow
+        }
         Connect-MgGraph -Scopes $Scopes -NoWelcome | Out-Null
     } catch {
         Write-Log -Level 'WARN' -Message "Interactive Microsoft Graph sign-in failed: $($_.Exception.Message). Falling back to device code."
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
         Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes
+    }
+
+    # Confirm the account that actually signed in matches what the user
+    # asked for; warn loudly if it doesn't so they don't waste time
+    # debugging a 403 caused by the wrong identity.
+    if ($loginHint) {
+        try {
+            $signedIn = (Get-MgContext).Account
+            if ($signedIn -and $signedIn -ne $loginHint) {
+                Write-Log -Level 'WARN' -Message ("Signed-in account ({0}) does not match the account you selected ({1}). If you hit 403 errors, run Disconnect-MgGraph and re-run." -f $signedIn, $loginHint)
+            }
+        } catch { }
     }
 }
 
@@ -1826,9 +1955,11 @@ if ($SkipRoleCheck) {
     Write-Log -Message 'Checking signed-in account for a directory role that qualifies for the per-user Copilot usage report.'
     $roleCheck = Test-Agent365ReportsAccess
     if (-not $roleCheck.Checked) {
-        Write-Log -Level 'WARN' -Message ('Could not enumerate directory roles for the signed-in account ({0}). Skipping role pre-check; the per-user Copilot report call may fail with 403 Forbidden.' -f ($roleCheck.UserPrincipalName ?? '<unknown>'))
+        $rcUpn = if ($roleCheck.UserPrincipalName) { $roleCheck.UserPrincipalName } else { '<unknown>' }
+        Write-Log -Level 'WARN' -Message ('Could not enumerate directory roles for the signed-in account ({0}). Skipping role pre-check; the per-user Copilot report call may fail with 403 Forbidden.' -f $rcUpn)
     } elseif ($roleCheck.HasQualifyingRole) {
-        Write-Log -Message ('Directory-role pre-check passed for {0}. Full-access roles assigned: {1}.' -f ($roleCheck.UserPrincipalName ?? '<unknown>'), ($roleCheck.FullAccessRoles -join ', '))
+        $rcUpn = if ($roleCheck.UserPrincipalName) { $roleCheck.UserPrincipalName } else { '<unknown>' }
+        Write-Log -Message ('Directory-role pre-check passed for {0}. Full-access roles assigned: {1}.' -f $rcUpn, ($roleCheck.FullAccessRoles -join ', '))
         if ($roleCheck.HasTenantOnlyRole) {
             Write-Log -Message ('  Additionally holds tenant-only role(s): {0} (not needed; full-access role takes precedence).' -f ($roleCheck.TenantOnlyRoles -join ', '))
         }
