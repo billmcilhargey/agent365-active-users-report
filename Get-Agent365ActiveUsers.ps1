@@ -31,14 +31,44 @@ param(
 
     [switch]$UseDeviceCode,
 
-    # Opt in to the Unified Audit Log (Exchange Online PowerShell, Windows-only).
-    # Required to surface unlicensed Copilot Chat activity not in the Graph report.
-    [switch]$IncludeUnifiedAuditLog,
+    # Optional login hint used across all auth paths. When supplied, this
+    # UPN is shown as the account to pick in browser / device-code flows,
+    # and passed through to Unified Audit Log child-session connections.
+    # Omit this parameter (or pass an empty string) to use the normal
+    # account picker on machines with interactive sign-in support.
+    [AllowEmptyString()]
+    [string]$SignInAccount,
+
+    # Explicitly request account-picker behavior without providing a UPN.
+    # Useful in automation/scripts where using "-SignInAccount" with no
+    # value would be a PowerShell parse error.
+    [switch]$PickSignInAccount,
+
+    # Unified Audit Log step (Exchange Online PowerShell, Windows-only).
+    # Disabled by default; pass -IncludeUnifiedAuditLog to opt in.
+    [bool]$IncludeUnifiedAuditLog = $false,
+
+    # Convenience force-disable switch; equivalent to
+    # -IncludeUnifiedAuditLog:$false.
+    [switch]$SkipUnifiedAuditLog,
 
     # Skip the Microsoft Entra directory-role pre-check (use for custom roles
     # the check does not recognise; see README "Required permissions").
     [switch]$SkipRoleCheck
 )
+
+# Honour the convenience opt-out switch.
+if ($SkipUnifiedAuditLog) { $IncludeUnifiedAuditLog = $false }
+
+if ($SignInAccount) {
+    $SignInAccount = $SignInAccount.Trim()
+}
+if ([string]::IsNullOrWhiteSpace($SignInAccount)) {
+    $SignInAccount = $null
+}
+if ($PickSignInAccount) {
+    $SignInAccount = $null
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -334,53 +364,6 @@ function Invoke-Agent365Preflight {
 
     $psv = $PSVersionTable.PSVersion
     Write-Log -Message "PowerShell version: $psv ($($PSVersionTable.PSEdition))"
-    if ($psv.Major -lt 7) {
-        Write-Log -Level 'WARN' -Message "PowerShell 7+ is recommended. Running on $psv."
-
-        # Prompt the user to upgrade to PowerShell 7+. They can continue on
-        # 5.1 at their own risk (some features may not work).
-        $upgradeAnswer = $null
-        try {
-            $upgradeAnswer = Read-Host -Prompt 'Upgrade to PowerShell 7+ recommended. Open the install page and exit now? [Y/N]'
-        } catch {
-            Write-Log -Level 'WARN' -Message "Could not prompt for upgrade decision: $($_.Exception.Message). Continuing on PowerShell $psv."
-        }
-        if ($upgradeAnswer -and $upgradeAnswer.Trim().ToUpperInvariant() -in @('Y', 'YES')) {
-            Write-Log -Message 'User chose to upgrade. Installing PowerShell 7 via winget per https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget.'
-
-            $winget = Get-Command -Name 'winget' -ErrorAction SilentlyContinue
-            if (-not $winget) {
-                Write-Log -Level 'ERROR' -Message 'winget was not found on PATH. Install App Installer from the Microsoft Store, or download PowerShell 7 manually.'
-                try { Start-Process 'https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget' | Out-Null } catch { }
-                exit 1
-            }
-
-            # Step 1: search winget for available PowerShell packages so the
-            # user sees what is being offered (matches the docs walk-through).
-            Write-Log -Message 'Running: winget search Microsoft.PowerShell'
-            & winget search Microsoft.PowerShell
-
-            # Step 2: install the stable PowerShell 7 package.
-            # --id ensures an exact match; --source winget pins the source;
-            # --accept-source-agreements / --accept-package-agreements make
-            # the install non-interactive so the script can complete.
-            Write-Log -Message 'Running: winget install --id Microsoft.PowerShell --source winget'
-            & winget install --id Microsoft.PowerShell --source winget --accept-source-agreements --accept-package-agreements
-            $wingetExit = $LASTEXITCODE
-
-            if ($wingetExit -eq 0) {
-                Write-Log -Level 'SUCCESS' -Message 'PowerShell 7 installation completed.'
-            } else {
-                Write-Log -Level 'WARN' -Message "winget exited with code $wingetExit. Review the output above for details."
-            }
-
-            Write-Host ''
-            Write-Host 'Open a NEW terminal (so PATH refreshes) and re-run this script with:' -ForegroundColor Yellow
-            Write-Host '    pwsh -File .\Get-Agent365ActiveUsers.ps1' -ForegroundColor Yellow
-            exit $wingetExit
-        }
-        Write-Log -Message "Continuing on PowerShell $psv at user's request."
-    }
 
     $platformName = if ($IsWindows) { 'Windows' } elseif ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'Unknown' }
     Write-Log -Message "Platform: $platformName"
@@ -398,7 +381,7 @@ function Invoke-Agent365Preflight {
             Write-Log -Level 'WARN' -Message 'Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows. On this platform the UAL step will be skipped and the report will use Graph data only.'
         }
     } else {
-        Write-Log -Message 'Unified Audit Log step: disabled (pass -IncludeUnifiedAuditLog to enable on Windows).'
+        Write-Log -Message 'Unified Audit Log step: disabled by default (pass -IncludeUnifiedAuditLog to enable, or -SkipUnifiedAuditLog to force-disable).'
     }
 
     Write-Log -Message "Installing/loading required modules: $($RequiredModules -join ', ')"
@@ -412,6 +395,56 @@ function Invoke-Agent365Preflight {
 
 $preflightModules = [System.Collections.Generic.List[string]]::new()
 $preflightModules.Add('Microsoft.Graph.Authentication')
+
+# The Unified Audit Log step (ExchangeOnlineManagement) cannot share a PS 5.1
+# session with Microsoft.Graph due to a Microsoft.Identity.Client assembly
+# conflict (BrokerExtension.WithBroker overload mismatch). If the user wants
+# UAL on Desktop PowerShell, prompt to upgrade to PowerShell 7+ via winget;
+# on decline, auto-disable UAL up-front so the run doesn't bother loading
+# EXO or attempting a doomed Exchange Online sign-in.
+if ($IncludeUnifiedAuditLog -and $IsWindows -and $PSVersionTable.PSEdition -eq 'Desktop') {
+    Write-Log -Level 'WARN' -Message 'Unified Audit Log step is enabled, but PowerShell 7+ is REQUIRED for it: Microsoft.Graph and ExchangeOnlineManagement cannot coexist in a Windows PowerShell 5.1 session (Microsoft.Identity.Client BrokerExtension.WithBroker assembly mismatch).'
+    $upgradeAnswer = $null
+    try {
+        $upgradeAnswer = Read-Host -Prompt 'Install PowerShell 7 now via winget (recommended), or skip the Unified Audit Log step and continue? [Y] Upgrade  [N] Skip UAL'
+    } catch {
+        Write-Log -Level 'WARN' -Message "Could not prompt for upgrade decision: $($_.Exception.Message). Skipping UAL step."
+    }
+
+    if ($upgradeAnswer -and $upgradeAnswer.Trim().ToUpperInvariant() -in @('Y', 'YES')) {
+        Write-Log -Message 'User chose to upgrade. Installing PowerShell 7 via winget per https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget.'
+
+        $winget = Get-Command -Name 'winget' -ErrorAction SilentlyContinue
+        if (-not $winget) {
+            Write-Log -Level 'ERROR' -Message 'winget was not found on PATH. Install App Installer from the Microsoft Store, or download PowerShell 7 manually.'
+            try { Start-Process 'https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows#winget' | Out-Null } catch { }
+            exit 1
+        }
+
+        Write-Log -Message 'Running: winget search Microsoft.PowerShell'
+        & winget search Microsoft.PowerShell
+
+        Write-Log -Message 'Running: winget install --id Microsoft.PowerShell --source winget'
+        & winget install --id Microsoft.PowerShell --source winget --accept-source-agreements --accept-package-agreements
+        $wingetExit = $LASTEXITCODE
+
+        if ($wingetExit -eq 0) {
+            Write-Log -Level 'SUCCESS' -Message 'PowerShell 7 installation completed.'
+        } else {
+            Write-Log -Level 'WARN' -Message "winget exited with code $wingetExit. Review the output above for details."
+        }
+
+        Write-Host ''
+        Write-Host 'Open a NEW terminal (so PATH refreshes) and re-run this script with:' -ForegroundColor Yellow
+        Write-Host '    pwsh -File .\Get-Agent365ActiveUsers.ps1' -ForegroundColor Yellow
+        exit $wingetExit
+    }
+
+    Write-Log -Level 'WARN' -Message 'User declined the PowerShell 7 upgrade. Unified Audit Log step will be SKIPPED (PowerShell 7+ is required for it).'
+    $IncludeUnifiedAuditLog = $false
+    Add-SkippedItem -Item 'Unified Audit Log (Search-UnifiedAuditLog)' -Reason 'PowerShell 7+ is required for the Unified Audit Log step (Microsoft.Graph + ExchangeOnlineManagement cannot coexist on Windows PowerShell 5.1), and the user declined the upgrade.' -Remediation 'Re-run this script with pwsh 7+, or accept the upgrade prompt next time.'
+}
+
 if ($IncludeUnifiedAuditLog -and $IsWindows) {
     $preflightModules.Add('ExchangeOnlineManagement')
 }
@@ -508,17 +541,14 @@ function Test-Agent365ReportsAccess {
     # records). roleTemplateId is the stable identifier; displayName is
     # the human-readable name (may differ slightly across tenants).
     $fullAccessRoles = @(
-        [pscustomobject]@{ DisplayName = 'Global Administrator';              TemplateId = '62e90394-69f5-4237-9190-012177145e10' }
-        [pscustomobject]@{ DisplayName = 'Company Administrator';             TemplateId = '62e90394-69f5-4237-9190-012177145e10' }
-        [pscustomobject]@{ DisplayName = 'AI Administrator';                  TemplateId = 'd2562ede-74db-457e-a7b6-544e236ebb61' }
-        [pscustomobject]@{ DisplayName = 'Reports Reader';                    TemplateId = '4a5d8f65-41da-4de4-8968-e035b65339cf' }
-        [pscustomobject]@{ DisplayName = 'Exchange Administrator';            TemplateId = '29232cdf-9323-42fd-ade2-1d097af3e4de' }
-        [pscustomobject]@{ DisplayName = 'SharePoint Administrator';          TemplateId = 'f28a1f50-f6e7-4571-818b-6a12f2af6b6c' }
-        [pscustomobject]@{ DisplayName = 'Teams Administrator';               TemplateId = '69091246-20e8-4a56-aa4d-066075b2a7a8' }
-        [pscustomobject]@{ DisplayName = 'Teams Service Administrator';       TemplateId = '69091246-20e8-4a56-aa4d-066075b2a7a8' }
-        [pscustomobject]@{ DisplayName = 'Teams Communications Administrator';TemplateId = 'baf37b3a-610e-45da-9e62-d9d1e5e8914b' }
-        [pscustomobject]@{ DisplayName = 'Skype for Business Administrator';  TemplateId = '75941009-915a-4869-abe7-691bff18279e' }
-        [pscustomobject]@{ DisplayName = 'Lync Administrator';                TemplateId = '75941009-915a-4869-abe7-691bff18279e' }
+        [pscustomobject]@{ DisplayName = 'Global Administrator';              TemplateId = '62e90394-69f5-4237-9190-012177145e10'; AliasNames = @('Company Administrator') }
+        [pscustomobject]@{ DisplayName = 'AI Administrator';                  TemplateId = 'd2562ede-74db-457e-a7b6-544e236ebb61'; AliasNames = @() }
+        [pscustomobject]@{ DisplayName = 'Reports Reader';                    TemplateId = '4a5d8f65-41da-4de4-8968-e035b65339cf'; AliasNames = @() }
+        [pscustomobject]@{ DisplayName = 'Exchange Administrator';            TemplateId = '29232cdf-9323-42fd-ade2-1d097af3e4de'; AliasNames = @() }
+        [pscustomobject]@{ DisplayName = 'SharePoint Administrator';          TemplateId = 'f28a1f50-f6e7-4571-818b-6a12f2af6b6c'; AliasNames = @() }
+        [pscustomobject]@{ DisplayName = 'Teams Administrator';               TemplateId = '69091246-20e8-4a56-aa4d-066075b2a7a8'; AliasNames = @('Teams Service Administrator') }
+        [pscustomobject]@{ DisplayName = 'Teams Communications Administrator';TemplateId = 'baf37b3a-610e-45da-9e62-d9d1e5e8914b'; AliasNames = @() }
+        [pscustomobject]@{ DisplayName = 'Skype for Business Administrator';  TemplateId = '75941009-915a-4869-abe7-691bff18279e'; AliasNames = @('Lync Administrator') }
     )
 
     # Roles documented as authorized but restricted to TENANT-LEVEL data
@@ -580,9 +610,19 @@ function Test-Agent365ReportsAccess {
 
         $tierTemplateIds  = @($tierDefs | Select-Object -ExpandProperty TemplateId  -Unique)
         $tierDisplayNames = @($tierDefs | Select-Object -ExpandProperty DisplayName -Unique)
+        $tierAliasNames   = @(
+            $tierDefs |
+                ForEach-Object {
+                    if ($_.PSObject.Properties.Match('AliasNames').Count -gt 0) {
+                        @($_.AliasNames)
+                    }
+                } |
+                Where-Object { $_ }
+        )
+        $tierAllNames     = @($tierDisplayNames + $tierAliasNames | Sort-Object -Unique)
 
         $matchedTemplateIds = @($assignedIds   | Where-Object { $tierTemplateIds  -contains $_ })
-        $matchedDisplayHits = @($assignedNames | Where-Object { $tierDisplayNames -contains $_ })
+        $matchedDisplayHits = @($assignedNames | Where-Object { $tierAllNames -contains $_ })
 
         $matched = @()
         foreach ($tid in ($matchedTemplateIds | Sort-Object -Unique)) {
@@ -590,7 +630,12 @@ function Test-Agent365ReportsAccess {
             if ($name) { $matched += $name }
         }
         foreach ($name in $matchedDisplayHits) {
-            if ($matched -notcontains $name) { $matched += $name }
+            if ($matched -notcontains $name) {
+                $canonical = ($tierDefs | Where-Object { $_.DisplayName -eq $name -or ($_.AliasNames -contains $name) } | Select-Object -First 1).DisplayName
+                if ($canonical -and ($matched -notcontains $canonical)) {
+                    $matched += $canonical
+                }
+            }
         }
         return @($matched | Sort-Object -Unique)
     }
@@ -688,7 +733,8 @@ function Invoke-DeviceCodeMgGraphSignIn {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$Scopes,
-        [int]$MaxAttempts = 3
+        [int]$MaxAttempts = 3,
+        [switch]$Immediate
     )
 
     $canPrompt = Test-CanPromptOnStdin
@@ -709,7 +755,9 @@ function Invoke-DeviceCodeMgGraphSignIn {
         Write-Host '    https://login.microsoft.com/device'
         Write-Host ''
 
-        if ($canPrompt) {
+        if ($Immediate) {
+            Write-Host 'Generating a device code now.'
+        } elseif ($canPrompt) {
             Write-Host ("When the sign-in page is open and ready, press Enter to receive a fresh code (attempt {0} of {1})..." -f $attempt, $MaxAttempts)
             [void](Read-Host)
         } else {
@@ -765,20 +813,32 @@ function Connect-Agent365Graph {
     $forceDisconnect = $false
 
     if ($existingCtx -and $existingCtx.Account) {
+        if ($PickSignInAccount) {
+            $forceDisconnect = $true
+            Write-Log -Message "-PickSignInAccount specified; clearing cached Microsoft Graph session ($($existingCtx.Account)) so account picker can be used."
+        }
+        if ($SignInAccount -and $existingCtx.Account -ne $SignInAccount) {
+            $forceDisconnect = $true
+            Write-Log -Message "Cached Microsoft Graph account ($($existingCtx.Account)) does not match requested sign-in account ($SignInAccount). Clearing cached session."
+        }
         Write-Host ''
         Write-Host ("A Microsoft Graph session is already cached for: {0}" -f $existingCtx.Account) -ForegroundColor Cyan
-        $reuse = $null
-        try {
-            $reuse = Read-Host -Prompt 'Use this account? [Y] Yes  [N] Sign in as a different account'
-        } catch {
-            Write-Log -Level 'WARN' -Message "Could not prompt for account selection: $($_.Exception.Message). Reusing cached account $($existingCtx.Account)."
-            $reuse = 'Y'
-        }
-        if ($reuse -and $reuse.Trim().ToUpperInvariant() -in @('N', 'NO')) {
-            $forceDisconnect = $true
-            Write-Log -Message "User chose to sign in with a different account; clearing cached session ($($existingCtx.Account))."
+        if (-not $forceDisconnect) {
+            $reuse = $null
+            try {
+                $reuse = Read-Host -Prompt 'Use this account? [Y] Yes  [N] Sign in as a different account'
+            } catch {
+                Write-Log -Level 'WARN' -Message "Could not prompt for account selection: $($_.Exception.Message). Reusing cached account $($existingCtx.Account)."
+                $reuse = 'Y'
+            }
+            if ($reuse -and $reuse.Trim().ToUpperInvariant() -in @('N', 'NO')) {
+                $forceDisconnect = $true
+                Write-Log -Message "User chose to sign in with a different account; clearing cached session ($($existingCtx.Account))."
+            } else {
+                Write-Log -Message "Reusing cached Microsoft Graph account: $($existingCtx.Account)."
+            }
         } else {
-            Write-Log -Message "Reusing cached Microsoft Graph account: $($existingCtx.Account)."
+            Write-Log -Message "Will sign in again to satisfy requested account hint."
         }
     } else {
         Write-Host ''
@@ -786,28 +846,19 @@ function Connect-Agent365Graph {
     }
 
     if (-not $existingCtx -or $forceDisconnect) {
-        # Ask which account the operator wants to use. The value is used as
-        # a login hint so the browser / device-code flow lands on the right
-        # account picker entry; leaving it blank shows the full picker.
-        $accountInput = $null
-        try {
-            $accountInput = Read-Host -Prompt 'Enter the user principal name (email) of the account to sign in with, or press Enter to choose from the account picker'
-        } catch {
-            Write-Log -Level 'WARN' -Message "Could not prompt for account UPN: $($_.Exception.Message). Continuing without a login hint."
-        }
-        if ($accountInput) {
-            $loginHint = $accountInput.Trim()
-            if ($loginHint) {
-                Write-Log -Message "User-selected sign-in account: $loginHint"
-            }
-        }
-
         if ($forceDisconnect) {
             try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose "Disconnect-MgGraph cleanup ignored: $($_.Exception.Message)" }
         }
-    } else {
-        # Reusing cached context — nothing more to do; Connect-MgGraph below
-        # will short-circuit on the existing token.
+    }
+
+    # Use the optional -SignInAccount parameter as a display-only login
+    # hint. We do NOT prompt the user for an account; if they want to
+    # target a specific one they pass it via -SignInAccount.
+    if ($SignInAccount) {
+        $loginHint = $SignInAccount.Trim()
+        if ($loginHint) {
+            Write-Log -Message "Target sign-in account (from -SignInAccount): $loginHint"
+        }
     }
 
     $useDevice = $UseDeviceCode.IsPresent
@@ -823,7 +874,7 @@ function Connect-Agent365Graph {
         if ($loginHint) {
             Write-Host ("When prompted on https://login.microsoft.com/device, sign in as: {0}" -f $loginHint) -ForegroundColor Yellow
         }
-        Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes
+        Invoke-DeviceCodeMgGraphSignIn -Scopes $Scopes -Immediate:$UseDeviceCode.IsPresent
         return
     }
 
@@ -840,13 +891,13 @@ function Connect-Agent365Graph {
     }
 
     # Confirm the account that actually signed in matches what the user
-    # asked for; warn loudly if it doesn't so they don't waste time
-    # debugging a 403 caused by the wrong identity.
+    # asked for via -SignInAccount; warn loudly if it doesn't so they
+    # don't waste time debugging a 403 caused by the wrong identity.
     if ($loginHint) {
         try {
             $signedIn = (Get-MgContext).Account
             if ($signedIn -and $signedIn -ne $loginHint) {
-                Write-Log -Level 'WARN' -Message ("Signed-in account ({0}) does not match the account you selected ({1}). If you hit 403 errors, run Disconnect-MgGraph and re-run." -f $signedIn, $loginHint)
+                Write-Log -Level 'WARN' -Message ("Signed-in account ({0}) does not match -SignInAccount ({1}). If you hit 403 errors, run Disconnect-MgGraph and re-run." -f $signedIn, $loginHint)
             }
         } catch { }
     }
@@ -864,11 +915,18 @@ function Connect-Agent365ExchangeOnline {
     } elseif (-not (Test-CanLaunchBrowser)) {
         Write-Log -Message 'No interactive browser detected in this environment. Using device code flow for Exchange Online.'
         $useDevice = $true
+    } elseif ($IsWindows) {
+        # ExchangeOnlineManagement uses the Windows broker/WAM path for its
+        # interactive flow. In this script that path is brittle on Windows,
+        # especially after Microsoft Graph has already loaded MSAL into the
+        # session. Use device code instead so the UAL step stays reliable.
+        Write-Log -Message 'Windows detected: using device code flow for Exchange Online to avoid broker/WAM sign-in failures.'
+        $useDevice = $true
     }
 
     if ($useDevice) {
         if (-not $NoProgress) { Write-Progress -Activity 'Agent 365 report' -Completed }
-        Invoke-DeviceCodeExoSignIn
+        Invoke-DeviceCodeExoSignIn -Immediate:$UseDeviceCode.IsPresent
         return
     }
 
@@ -882,10 +940,445 @@ function Connect-Agent365ExchangeOnline {
     }
 }
 
+function Invoke-Agent365UnifiedAuditLogQuery {
+    [CmdletBinding()]
+    param(
+        [string]$UserPrincipalName,
+        [Parameter(Mandatory = $true)]
+        [int]$Days,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Operations,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ResultSize,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputJsonPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ErrorLogPath,
+
+        [switch]$UseDeviceCode,
+        [switch]$PickSignInAccount
+    )
+
+    $pwshCommand = Get-Command -Name 'pwsh' -ErrorAction Stop
+    $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.ps1" -f ([guid]::NewGuid().ToString('N')))
+
+    $childScript = @'
+param(
+    [string]$UserPrincipalName,
+
+    [Parameter(Mandatory = $true)]
+    [int]$Days,
+
+    [Parameter(Mandatory = $true)]
+    [string[]]$Operations,
+
+    [Parameter(Mandatory = $true)]
+    [int]$ResultSize
+
+    , [Parameter(Mandatory = $true)]
+    [string]$OutputJsonPath
+
+    , [Parameter(Mandatory = $true)]
+    [string]$ErrorLogPath
+
+    , [switch]$UseDeviceCode
+
+    , [switch]$PickSignInAccount
+)
+
+try {
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    Set-StrictMode -Version Latest
+
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+
+    $ipssConnectCommand = Get-Command -Name 'Connect-IPPSSession' -ErrorAction Stop
+    $ipssSupportsDisableWam = $ipssConnectCommand.Parameters.ContainsKey('DisableWAM')
+    $ipssSupportsUseRps = $ipssConnectCommand.Parameters.ContainsKey('UseRPSSession')
+    $ipssSupportsDevice = $ipssConnectCommand.Parameters.ContainsKey('Device')
+    $ipssSupportsUseDeviceAuth = $ipssConnectCommand.Parameters.ContainsKey('UseDeviceAuthentication')
+
+    function Connect-Agent365IppsSessionWithFallback {
+        param(
+            [hashtable]$BaseParams = @{},
+            [switch]$UseDeviceCode
+        )
+
+        $attempts = [System.Collections.Generic.List[hashtable]]::new()
+
+        # Default connection is generally the most stable. Restricting import
+        # with -CommandName can hang in some tenants/sessions, so try it last.
+        $attempts.Add(@{ Label = 'default'; Params = @{ ShowBanner = $false } })
+
+        if ($ipssSupportsUseRps) {
+            $attempts.Add(@{ Label = 'UseRPSSession'; Params = @{ ShowBanner = $false; UseRPSSession = $true } })
+        }
+
+        $attempts.Add(@{ Label = 'CommandName=Search-UnifiedAuditLog'; Params = @{ ShowBanner = $false; CommandName = 'Search-UnifiedAuditLog' } })
+
+        $lastError = $null
+        foreach ($attempt in $attempts) {
+            $params = @{} + $attempt.Params
+            foreach ($kv in $BaseParams.GetEnumerator()) {
+                $params[$kv.Key] = $kv.Value
+            }
+            if ($ipssSupportsDisableWam) {
+                $params.DisableWAM = $true
+            }
+            if ($UseDeviceCode) {
+                if ($ipssSupportsDevice) {
+                    $params.Device = $true
+                } elseif ($ipssSupportsUseDeviceAuth) {
+                    $params.UseDeviceAuthentication = $true
+                }
+            }
+
+            Write-Host ("Connecting Security & Compliance session using {0}..." -f $attempt.Label)
+            try {
+                Connect-IPPSSession @params -ErrorAction Stop | Out-Null
+                Write-Host ("Security & Compliance connection established using {0}." -f $attempt.Label)
+                return
+            } catch {
+                $lastError = $_
+                Write-Host ("Security & Compliance connection attempt failed ({0}): {1}" -f $attempt.Label, $_.Exception.Message)
+            }
+        }
+
+        if ($lastError -and $lastError.Exception.Message -match 'Error Acquiring Token') {
+            throw [System.InvalidOperationException]::new(
+                "Security & Compliance sign-in failed with token acquisition errors after all connection strategies. Try re-running with -UseDeviceCode again and complete sign-in in the same browser profile where your tenant account is active. If this persists, re-run with -SkipUnifiedAuditLog to finish the report while EXO auth is investigated. Last error: $($lastError.Exception.Message)"
+            )
+        }
+
+        if ($lastError) {
+            throw [System.InvalidOperationException]::new("All Security & Compliance connection strategies failed. Last error: $($lastError.Exception.Message)")
+        }
+
+        throw [System.InvalidOperationException]::new('All Security & Compliance connection strategies failed with no detailed error.')
+    }
+
+    function Test-EnsureSearchUnifiedAuditLogAvailable {
+        param(
+            [hashtable]$BaseParams = @{},
+            [switch]$UseDeviceCode
+        )
+
+        if (Get-Command -Name 'Search-UnifiedAuditLog' -ErrorAction SilentlyContinue) {
+            return $true
+        }
+
+        Write-Host 'Search-UnifiedAuditLog not yet available. Attempting manual import from compliance remote session...'
+        $complianceSessions = @(
+            Get-PSSession -ErrorAction SilentlyContinue |
+                Where-Object {
+                    ($_.ComputerName -like '*ps.compliance.protection.outlook.com*') -or
+                    ($_.ComputerName -like '*outlook.office365.com*')
+                }
+        )
+
+        foreach ($session in $complianceSessions) {
+            try {
+                Import-PSSession -Session $session -CommandName 'Search-UnifiedAuditLog' -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+                if (Get-Command -Name 'Search-UnifiedAuditLog' -ErrorAction SilentlyContinue) {
+                    Write-Host 'Search-UnifiedAuditLog imported successfully from compliance remote session.'
+                    return $true
+                }
+            } catch {
+                Write-Host ("Manual import attempt failed from session '{0}': {1}" -f $session.Name, $_.Exception.Message)
+            }
+        }
+
+        if (-not $ipssSupportsUseRps) {
+            return $false
+        }
+
+        Write-Host 'Search-UnifiedAuditLog still unavailable. Reconnecting Security & Compliance session with UseRPSSession for cmdlet import...'
+        $rpsParams = @{ ShowBanner = $false; UseRPSSession = $true }
+        foreach ($kv in $BaseParams.GetEnumerator()) {
+            $rpsParams[$kv.Key] = $kv.Value
+        }
+        if ($ipssSupportsDisableWam) {
+            $rpsParams.DisableWAM = $true
+        }
+        if ($UseDeviceCode) {
+            if ($ipssSupportsDevice) {
+                $rpsParams.Device = $true
+            } elseif ($ipssSupportsUseDeviceAuth) {
+                $rpsParams.UseDeviceAuthentication = $true
+            }
+        }
+
+        try {
+            Connect-IPPSSession @rpsParams -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host ("UseRPSSession reconnect failed: {0}" -f $_.Exception.Message)
+            return $false
+        }
+
+        return [bool](Get-Command -Name 'Search-UnifiedAuditLog' -ErrorAction SilentlyContinue)
+    }
+
+    function Test-HasUnifiedAuditLogPermission {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$PrincipalName
+        )
+
+    $allowedRoleNames = @(
+        'Audit Logs',
+        'View-Only Audit Logs',
+        'Audit Manager',
+        'Audit Reader',
+        'Organization Management',
+        'Global Administrator',
+        'Company Administrator',
+        'Compliance Administrator',
+        'Compliance Data Administrator',
+        'Security Administrator',
+        'Security Operator',
+        'Global Reader'
+    )
+
+    try {
+        $roleAssignments = @(Get-ManagementRoleAssignment -RoleAssignee $PrincipalName -Enabled $true -ErrorAction Stop)
+        foreach ($assignment in $roleAssignments) {
+            $roleName = $null
+            try { $roleName = [string]$assignment.Role } catch { $roleName = $null }
+            if ($roleName -and ($allowedRoleNames -contains $roleName.Trim())) {
+                return $true
+            }
+        }
+    } catch {
+        Write-Verbose "Get-ManagementRoleAssignment lookup failed: $($_.Exception.Message)"
+    }
+
+    foreach ($roleGroup in @('Audit Logs', 'View-Only Audit Logs')) {
+        try {
+            $members = @(Get-RoleGroupMember $roleGroup -ErrorAction Stop)
+        } catch {
+            continue
+        }
+
+        foreach ($member in $members) {
+            foreach ($propertyName in @('UserPrincipalName', 'PrimarySmtpAddress', 'WindowsLiveID', 'DisplayName', 'Name', 'EmailAddress')) {
+                $memberValue = $null
+                try { $memberValue = [string]$member.$propertyName } catch { $memberValue = $null }
+                if ($memberValue -and $memberValue.Trim().ToUpperInvariant() -eq $PrincipalName.Trim().ToUpperInvariant()) {
+                    return $true
+                }
+            }
+        }
+    }
+
+    return $false
+}
+
+    $useDeviceCode = $UseDeviceCode.IsPresent
+    if ($PickSignInAccount.IsPresent -and -not $useDeviceCode) {
+        Write-Host 'PickSignInAccount requested: using interactive browser sign-in for Unified Audit Log session.'
+        $exoInteractiveParams = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+        if ($UserPrincipalName) {
+            $exoInteractiveParams.UserPrincipalName = $UserPrincipalName
+            Write-Host ("Unified Audit Log account hint for Exchange Online: {0}" -f $UserPrincipalName)
+        }
+
+        try {
+            Connect-ExchangeOnline @exoInteractiveParams | Out-Null
+        } catch {
+            Write-Host ("Interactive Exchange Online sign-in failed in picker mode: {0}. Falling back to device code for UAL session." -f $_.Exception.Message)
+            $useDeviceCode = $true
+        }
+    }
+
+    if ($useDeviceCode) {
+        Write-Host 'Using device code authentication for Unified Audit Log access.'
+        $exoConnectParams = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+        if ($UserPrincipalName) {
+            $exoConnectParams.UserPrincipalName = $UserPrincipalName
+            Write-Host ("Unified Audit Log account hint for Exchange Online: {0}" -f $UserPrincipalName)
+        }
+        try {
+            Connect-ExchangeOnline @exoConnectParams -Device | Out-Null
+        } catch [System.Management.Automation.ParameterBindingException] {
+            Connect-ExchangeOnline @exoConnectParams -UseDeviceAuthentication | Out-Null
+        }
+        Write-Host 'Exchange Online device-code sign-in completed. Connecting Security & Compliance session (this can take up to a few minutes)...'
+        if (-not $ipssSupportsDevice -and -not $ipssSupportsUseDeviceAuth) {
+            Write-Host 'Connect-IPPSSession does not expose a device-code switch in this module version; using default auth for IPPS session.'
+        }
+        Connect-Agent365IppsSessionWithFallback -UseDeviceCode
+        Write-Host 'Security & Compliance session connected. Verifying Search-UnifiedAuditLog availability...'
+        if (-not (Test-EnsureSearchUnifiedAuditLogAvailable -UseDeviceCode)) {
+            throw [System.InvalidOperationException]::new('Device code authentication completed, but Search-UnifiedAuditLog could not be imported into the session (manual import and UseRPSSession recovery both failed).')
+        }
+    } else {
+        $connectParams = @{}
+        if ($UserPrincipalName) {
+            $connectParams.UserPrincipalName = $UserPrincipalName
+            Write-Host ("Unified Audit Log account hint for Security & Compliance: {0}" -f $UserPrincipalName)
+        }
+
+        Connect-Agent365IppsSessionWithFallback -BaseParams $connectParams
+        if (-not (Test-EnsureSearchUnifiedAuditLogAvailable -BaseParams $connectParams)) {
+            throw [System.InvalidOperationException]::new('Security & Compliance authentication completed, but Search-UnifiedAuditLog could not be imported into the session (manual import and UseRPSSession recovery both failed).')
+        }
+    }
+
+    Write-Host 'Unified Audit Log authentication complete. Running Search-UnifiedAuditLog query...'
+
+$effectivePrincipal = $null
+if ($UserPrincipalName) {
+    $effectivePrincipal = $UserPrincipalName
+} else {
+    try {
+        $activeConnection = Get-ConnectionInformation -ErrorAction Stop | Where-Object { $_.State -eq 'Connected' } | Select-Object -First 1
+        if ($activeConnection -and $activeConnection.UserPrincipalName) {
+            $effectivePrincipal = [string]$activeConnection.UserPrincipalName
+        }
+    } catch {
+        $effectivePrincipal = $null
+    }
+}
+
+if ($effectivePrincipal) {
+    Write-Host ("Unified Audit Log effective signed-in account: {0}" -f $effectivePrincipal)
+    if (-not (Test-HasUnifiedAuditLogPermission -PrincipalName $effectivePrincipal)) {
+        throw [System.InvalidOperationException]::new(
+            "Signed-in account '$effectivePrincipal' does not appear to have an audit-log role assignment that grants Search-UnifiedAuditLog access. Assign Audit Logs / View-Only Audit Logs, or one of the equivalent admin roles documented by Microsoft (for example Global Administrator via Organization Management, Global Reader via View-Only Audit Logs, or Audit Manager / Audit Reader), then re-run."
+        )
+    }
+} else {
+    Write-Host 'Unified Audit Log effective signed-in account could not be determined; continuing without explicit audit-role pre-check.'
+}
+
+$startDate = (Get-Date).ToUniversalTime().AddDays(-$Days)
+$endDate = (Get-Date).ToUniversalTime()
+    $records = Search-UnifiedAuditLog -StartDate $startDate -EndDate $endDate -Operations $Operations -ResultSize $ResultSize
+
+    Write-Host ("Unified Audit Log query complete. Records returned: {0}" -f @($records).Count)
+
+    $records | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $OutputJsonPath -Encoding UTF8
+} catch {
+    $detail = $_ | Out-String
+    Set-Content -LiteralPath $ErrorLogPath -Value $detail -Encoding UTF8
+    throw
+}
+'@
+
+    Set-Content -LiteralPath $tempScriptPath -Value $childScript -Encoding UTF8
+
+    try {
+        Write-Log -Message 'Connecting to Security & Compliance PowerShell in a separate pwsh process for Unified Audit Log access.'
+
+        $outputJsonPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        $errorLogPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.err.txt" -f ([guid]::NewGuid().ToString('N')))
+
+        $childArgs = @(
+            '-NoLogo'
+            '-NoProfile'
+            '-File'
+            $tempScriptPath
+            '-Days'
+            $Days
+            '-Operations'
+            $Operations
+            '-ResultSize'
+            $ResultSize
+            '-OutputJsonPath'
+            $outputJsonPath
+            '-ErrorLogPath'
+            $errorLogPath
+        )
+        if (-not [string]::IsNullOrWhiteSpace($UserPrincipalName)) {
+            $childArgs += @('-UserPrincipalName', $UserPrincipalName)
+        }
+        if ($UseDeviceCode) {
+            $childArgs += @('-UseDeviceCode')
+        }
+        if ($PickSignInAccount) {
+            $childArgs += @('-PickSignInAccount')
+        }
+
+        $childLogPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.log" -f ([guid]::NewGuid().ToString('N')))
+        & $pwshCommand.Path @childArgs 2>&1 | Tee-Object -FilePath $childLogPath | Out-Host
+
+        if ($LASTEXITCODE -ne 0) {
+            $message = "pwsh exited with code $LASTEXITCODE while querying Unified Audit Log."
+            if (Test-Path -LiteralPath $childLogPath) {
+                $childError = (Get-Content -LiteralPath $childLogPath -Raw).Trim()
+                if ($childError) {
+                    $message = "$message Original child error:`n$childError"
+                }
+            }
+            if (Test-Path -LiteralPath $errorLogPath) {
+                $errorDetail = (Get-Content -LiteralPath $errorLogPath -Raw).Trim()
+                if ($errorDetail) {
+                    $message = "$message Detailed child exception:`n$errorDetail"
+                }
+            }
+            throw [System.InvalidOperationException]::new($message)
+        }
+
+        $json = ''
+        if (Test-Path -LiteralPath $outputJsonPath) {
+            $json = (Get-Content -LiteralPath $outputJsonPath -Raw).Trim()
+        }
+        if (-not $json) {
+            return @()
+        }
+
+        $records = $json | ConvertFrom-Json
+        if ($null -eq $records) {
+            return @()
+        }
+
+        if ($records -isnot [System.Array]) {
+            return @($records)
+        }
+
+        return @($records)
+    } catch {
+        if (Test-Path -LiteralPath $childLogPath) {
+            Write-Log -Level 'ERROR' -Message "Unified Audit child console log preserved at: $childLogPath"
+        }
+        if (Test-Path -LiteralPath $errorLogPath) {
+            Write-Log -Level 'ERROR' -Message "Unified Audit child exception log preserved at: $errorLogPath"
+        }
+        if (Test-Path -LiteralPath $errorLogPath) {
+            try {
+                $errorDetail = (Get-Content -LiteralPath $errorLogPath -Raw).Trim()
+                if ($errorDetail) {
+                    Write-Log -Level 'ERROR' -Message "Unified Audit child exception detail:`n$errorDetail"
+                }
+            } catch { }
+        }
+        throw [System.InvalidOperationException]::new(
+            "Failed to query Unified Audit Log in a separate PowerShell session. Original error: $($_.Exception.Message)"
+        )
+    } finally {
+        if (Test-Path -LiteralPath $outputJsonPath) {
+            Remove-Item -LiteralPath $outputJsonPath -ErrorAction SilentlyContinue
+        }
+        if ((Test-Path -LiteralPath $childLogPath) -and $LASTEXITCODE -eq 0) {
+            Remove-Item -LiteralPath $childLogPath -ErrorAction SilentlyContinue
+        }
+        if ((Test-Path -LiteralPath $errorLogPath) -and $LASTEXITCODE -eq 0) {
+            Remove-Item -LiteralPath $errorLogPath -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $tempScriptPath -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-DeviceCodeExoSignIn {
     [CmdletBinding()]
     param(
-        [int]$MaxAttempts = 3
+        [int]$MaxAttempts = 3,
+        [switch]$Immediate
     )
 
     $canPrompt = Test-CanPromptOnStdin
@@ -906,7 +1399,9 @@ function Invoke-DeviceCodeExoSignIn {
         Write-Host '    https://login.microsoft.com/device'
         Write-Host ''
 
-        if ($canPrompt) {
+        if ($Immediate) {
+            Write-Host 'Generating a device code now.'
+        } elseif ($canPrompt) {
             Write-Host ("When the sign-in page is open and ready, press Enter to receive a fresh code (attempt {0} of {1})..." -f $attempt, $MaxAttempts)
             [void](Read-Host)
         } else {
@@ -914,10 +1409,33 @@ function Invoke-DeviceCodeExoSignIn {
         }
 
         try {
-            Connect-ExchangeOnline -ShowBanner:$false -Device
+            # ExchangeOnlineManagement renamed its device-code switch across
+            # versions: v3.x uses -Device, earlier 2.0.x builds use
+            # -UseDeviceAuthentication. Get-Command.Parameters does not
+            # always surface these on PS 5.1 (proxy functions hide dynamic
+            # parameters), so probe by trying the calls directly.
+            try {
+                Connect-ExchangeOnline -ShowBanner:$false -Device -ErrorAction Stop
+            } catch [System.Management.Automation.ParameterBindingException] {
+                Write-VerboseLog -Message '-Device not accepted by this Connect-ExchangeOnline; trying -UseDeviceAuthentication.'
+                Connect-ExchangeOnline -ShowBanner:$false -UseDeviceAuthentication -ErrorAction Stop
+            }
             return
         } catch {
             $message = $_.Exception.Message
+
+            # Hard-fail fast on the well-known PS 5.1 + Microsoft.Graph +
+            # ExchangeOnlineManagement MSAL assembly conflict. Microsoft.Graph
+            # loads an older Microsoft.Identity.Client into the AppDomain
+            # first; EXO then tries to call a newer BrokerExtension.WithBroker
+            # overload that doesn't exist on that older assembly. Retrying
+            # device codes will not fix this -- the only workarounds are
+            # running on PowerShell 7+, or running EXO in a separate process.
+            if ($message -match 'BrokerExtension\.WithBroker' -or $_.Exception -is [System.MissingMethodException]) {
+                throw [System.InvalidOperationException]::new(
+                    "Exchange Online sign-in cannot proceed in this session due to a Microsoft.Identity.Client assembly conflict between Microsoft.Graph and ExchangeOnlineManagement on Windows PowerShell 5.1. Remediation: run this script on PowerShell 7+ (pwsh), or re-run with -SkipUnifiedAuditLog to bypass the UAL step. Original error: $message"
+                )
+            }
 
             # Exchange Online's auth flow can throw a timeout even after the
             # browser-side sign-in succeeded. Check Get-ConnectionInformation:
@@ -946,11 +1464,27 @@ function Get-ActiveUsersFromUnifiedAudit {
         [Parameter(Mandatory = $true)]
         [string[]]$Operations,
         [Parameter(Mandatory = $true)]
-        [int]$ResultSize
+        [int]$ResultSize,
+        [string]$UserPrincipalName,
+        [switch]$PickSignInAccount
     )
 
     if (-not $IsWindows) {
         Write-Log -Level 'WARN' -Message 'Skipping Unified Audit Log step: Search-UnifiedAuditLog / Connect-IPPSSession require Exchange Online PowerShell on Windows. The Graph user-detail report is being used instead.'
+        return @()
+    }
+
+    # Pre-emptive skip on Windows PowerShell 5.1: once Microsoft.Graph has
+    # loaded its (older) Microsoft.Identity.Client into the AppDomain, any
+    # ExchangeOnlineManagement sign-in attempt in the same session fails
+    # with a 'Method not found: BrokerExtension.WithBroker(BrokerOptions)'
+    # MissingMethodException. The only workarounds are PowerShell 7+ or a
+    # separate process for EXO. Skip cleanly with remediation instead of
+    # asking the user to wait through a doomed device-code prompt.
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -and (Get-Module -Name Microsoft.Graph.Authentication)) {
+        $skipReason = 'Windows PowerShell 5.1 cannot load Microsoft.Graph and ExchangeOnlineManagement in the same session (Microsoft.Identity.Client assembly mismatch: BrokerExtension.WithBroker overload not found).'
+        Write-Log -Level 'WARN' -Message $skipReason
+        Add-SkippedItem -Item 'Unified Audit Log (Search-UnifiedAuditLog)' -Reason $skipReason -Remediation 'Re-run this script on PowerShell 7+ (pwsh), or run with -SkipUnifiedAuditLog to suppress this step and rely on Graph data only.'
         return @()
     }
 
@@ -959,26 +1493,58 @@ function Get-ActiveUsersFromUnifiedAudit {
         return @()
     }
 
-    try {
-        $connectionInfo = Get-ConnectionInformation -ErrorAction Stop
-    } catch {
-        $connectionInfo = $null
+    $signInAccount = $null
+    if ($UserPrincipalName) {
+        $signInAccount = $UserPrincipalName.Trim()
+        if ($signInAccount) {
+            Write-Log -Message "Unified Audit Log sign-in account hint: $signInAccount"
+        }
     }
-
-    if (-not $connectionInfo) {
-        Connect-Agent365ExchangeOnline -UseDeviceCode:$UseDeviceCode
+    if (-not $signInAccount -and -not $PickSignInAccount) {
+        try {
+            $signInAccount = (Get-MgContext).Account
+        } catch {
+            $signInAccount = $null
+        }
+    }
+    if ($PickSignInAccount -and -not $signInAccount) {
+        Write-Log -Message '-PickSignInAccount requested: Unified Audit Log child session will prompt for explicit account sign-in (no Graph account hint fallback).'
     }
 
     $startDate = (Get-Date).ToUniversalTime().AddDays(-$Days)
     $endDate = (Get-Date).ToUniversalTime()
 
-    $records = @()
     try {
         Write-Log -Message "Querying Unified Audit Log for the last $Days days. Operations: $($Operations -join ', '). ResultSize: $ResultSize"
-        $records = Search-UnifiedAuditLog -StartDate $startDate -EndDate $endDate -Operations $Operations -ResultSize $ResultSize
+        $outputJsonPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.json" -f ([guid]::NewGuid().ToString('N')))
+        $errorLogPath = Join-Path ([System.IO.Path]::GetTempPath()) ("agent365-ual-{0}.err.txt" -f ([guid]::NewGuid().ToString('N')))
+        $ualUseDeviceCode = $UseDeviceCode.IsPresent
+        $records = Invoke-Agent365UnifiedAuditLogQuery `
+            -UserPrincipalName $signInAccount `
+            -Days $Days `
+            -Operations $Operations `
+            -ResultSize $ResultSize `
+            -OutputJsonPath $outputJsonPath `
+            -ErrorLogPath $errorLogPath `
+            -UseDeviceCode:$ualUseDeviceCode `
+            -PickSignInAccount:$PickSignInAccount
     } catch {
-        Write-Log -Level 'ERROR' -Message "Unified Audit Log query failed: $($_.Exception.Message)"
-        throw "Failed to query Unified Audit Log with operations [$($Operations -join ', ')]. Error: $($_.Exception.Message)"
+        $message = $_.Exception.Message
+        if ($message -match 'Audit Logs or View-Only Audit Logs role|required for Search-UnifiedAuditLog|does not appear to have an audit-log role assignment') {
+            Write-Log -Level 'WARN' -Message $message
+            Add-SkippedItem -Item 'Unified Audit Log (Search-UnifiedAuditLog)' -Reason $message -Remediation 'Assign the Audit Logs or View-Only Audit Logs role in Microsoft Purview, then re-run the script.'
+            return @()
+        }
+        $ualImportFailure = (($message -match 'Search-UnifiedAuditLog') -and ($message -match 'import')) -or ($message -match 'UseRPSSession recovery both failed')
+        if ($ualImportFailure -or $message -match 'Error Acquiring Token') {
+            $skipReason = "Unified Audit Log step could not load Search-UnifiedAuditLog in the isolated Security & Compliance session. $message"
+            Write-Log -Level 'WARN' -Message $skipReason
+            Add-SkippedItem -Item 'Unified Audit Log (Search-UnifiedAuditLog)' -Reason $skipReason -Remediation 'Update ExchangeOnlineManagement to the latest version, then re-run with -UseDeviceCode. If this tenant/session still cannot import Search-UnifiedAuditLog, run with -SkipUnifiedAuditLog to complete from Graph-only data.'
+            return @()
+        }
+
+        Write-Log -Level 'ERROR' -Message "Unified Audit Log query failed: $message"
+        throw "Failed to query Unified Audit Log with operations [$($Operations -join ', ')]. Error: $message"
     }
 
     if (-not $records) {
@@ -2085,18 +2651,26 @@ if ($IncludeUnifiedAuditLog) {
     } else {
         Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from Unified Audit Log'
         Write-Log -Message 'Collecting active users from Unified Audit Log.'
-        $auditCandidates = Get-ActiveUsersFromUnifiedAudit -Days $days -Operations $AuditOperations -ResultSize $AuditResultSize
+        # Wrap in @(...) so an empty/$null return is preserved as an empty
+        # array under Set-StrictMode (otherwise .Count below throws
+        # PropertyNotFoundStrict).
+        $auditCandidates = @(Get-ActiveUsersFromUnifiedAudit -Days $days -Operations $AuditOperations -ResultSize $AuditResultSize -UserPrincipalName $SignInAccount -PickSignInAccount:$PickSignInAccount)
         Write-Log -Message "UAL returned $($auditCandidates.Count) unique users."
     }
 } else {
-    Write-Log -Message 'Unified Audit Log step skipped (pass -IncludeUnifiedAuditLog on Windows to include).'
+    Write-Log -Message 'Unified Audit Log step skipped (disabled via -IncludeUnifiedAuditLog:$false or -SkipUnifiedAuditLog, or running on a non-Windows host).'
 }
 $script:StepId++
 
 # Wrap in @(...) so an empty merge result is preserved as an empty array
 # rather than being unwrapped to $null under Set-StrictMode.
 $mergedCandidates = @(Merge-Agent365ActiveUserCandidates -GraphCandidates $graphCandidates -AuditCandidates $auditCandidates)
-Write-Log -Message ("Merged candidate count after dedup: {0}." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
+$mergedCountMsg = if ($userDetailUnavailable) {
+    "Merged candidate count after dedup: {0} (per-user step skipped; only audit/license sources contributed)." -f $mergedCandidates.Count
+} else {
+    "Merged candidate count after dedup: {0}." -f $mergedCandidates.Count
+}
+Write-Log -Message $mergedCountMsg
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Resolving Agent 365 SKUs'
 Write-Log -Message 'Resolving Agent 365 SKU IDs from subscribed SKUs.'
@@ -2106,7 +2680,12 @@ $matchedSkuPartNumbers = @($skuMatchResults.MatchedSkuPartNumbers)
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Classifying licensed vs unlicensed users'
-Write-Log -Message ("Classifying active users by license assignment (count: {0})." -f (Format-CountOrSkipped -Count $mergedCandidates.Count -WasSkipped $userDetailUnavailable))
+$classifyMsg = if ($userDetailUnavailable) {
+    "Classifying active users by license assignment (count: {0}; per-user step skipped)." -f $mergedCandidates.Count
+} else {
+    "Classifying active users by license assignment (count: {0})." -f $mergedCandidates.Count
+}
+Write-Log -Message $classifyMsg
 $classification = Get-ActiveUserLicenseClassification -ActiveUsers $mergedCandidates -CopilotSkuIds $copilotSkuIds
 $script:StepId++
 
@@ -2123,7 +2702,7 @@ $ualNoteHtml = if ($IncludeUnifiedAuditLog -and $IsWindows) {
 } elseif ($IncludeUnifiedAuditLog) {
     ' Unified Audit Log was requested but skipped because Search-UnifiedAuditLog requires Exchange Online PowerShell on Windows.'
 } else {
-    ' The Unified Audit Log path is disabled by default. Pass <code>-IncludeUnifiedAuditLog</code> on Windows to also include unlicensed Copilot Chat activity from audit records.'
+    ' The Unified Audit Log path is disabled by default. Re-run on Windows with <code>-IncludeUnifiedAuditLog</code> to also include unlicensed Copilot Chat activity from audit records, or use <code>-SkipUnifiedAuditLog</code> to force-disable it.'
 }
 
 $dataSources = [PSCustomObject]@{
@@ -2191,15 +2770,16 @@ if ($dataSources.UalRequested) {
 } elseif (-not $IsWindows) {
     Write-Host '[SKIPPED] Unified Audit Log is unavailable on this platform.' -ForegroundColor Yellow
     Write-Host ("  Reason: Search-UnifiedAuditLog requires Exchange Online PowerShell, which is Windows-only in PowerShell 7. Detected platform: {0}." -f $(if ($IsLinux) { 'Linux' } elseif ($IsMacOS) { 'macOS' } else { 'non-Windows' }))
-} else {
-    Write-Host 'Unified Audit Log: disabled (pass -IncludeUnifiedAuditLog to enable).'
 }
+# Note: when UAL was disabled (declined upgrade, -SkipUnifiedAuditLog, etc.)
+# the reason is already reported in the Skipped-steps section printed below.
 
 New-Agent365HtmlReport -OutputPath $ReportPath -Summary $result -LicensedUsers $licensedTableUsers -UnlicensedUsers $unlicensedTableUsers -MatchedSkuPartNumbers $matchedSkuPartNumbers -TenantInfo $tenantInfo -DataSources $dataSources
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Finalizing report output'
-Write-Log -Message "HTML report generated at: $script:ReportFullPath"
+# Report path is printed at the very end of the run (browser-launch block),
+# so we don't echo it here.
 
 if ($VerboseLog) {
     Write-Host 'Verbose logging: enabled'

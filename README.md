@@ -19,7 +19,7 @@ PowerShell reporting utility that produces an HTML report of Agent 365 (Microsof
   - Read Microsoft 365 usage reports (Microsoft Graph scope `Reports.Read.All`).
   - Read user and organization data (`User.Read.All`, `Organization.Read.All`).
   - **A Microsoft Entra directory role that qualifies for the per-user Copilot usage report** — see [Required permissions](#required-permissions) below.
-  - *(Only when `-IncludeUnifiedAuditLog` is used)* Search the Unified Audit Log in Exchange Online (e.g. **View-Only Audit Logs** or **Audit Logs** role).
+  - *(Only when `-IncludeUnifiedAuditLog` is used)* Search the Unified Audit Log in Exchange Online. The script checks the effective audit-log role assignment before querying, including inherited equivalents such as Global Administrator / Company Administrator via Organization Management and Global Reader via View-Only Audit Logs.
 
 The script installs the required modules on first run (per-user scope). `ExchangeOnlineManagement` is only installed when you opt in to `-IncludeUnifiedAuditLog`.
 
@@ -31,12 +31,12 @@ The `getMicrosoft365CopilotUsageUserDetail` Graph endpoint has stricter access r
 
 - **Reports Reader** (least privilege — recommended)
 - **AI Administrator**
-- **Global Administrator** (Company Administrator)
+- **Global Administrator** (also shown as Company Administrator)
 - **Exchange Administrator**
 - **SharePoint Administrator**
-- **Teams Administrator** (Teams Service Administrator)
+- **Teams Administrator** (also shown as Teams Service Administrator)
 - **Teams Communications Administrator**
-- **Skype for Business Administrator** (Lync Administrator)
+- **Skype for Business Administrator** (also shown as Lync Administrator)
 
 **Tenant-only roles (insufficient — return aggregate data only, no per-user detail):**
 
@@ -44,6 +44,8 @@ The `getMicrosoft365CopilotUsageUserDetail` Graph endpoint has stricter access r
 - **Usage Summary Reports Reader**
 
 Per [Microsoft's authorization documentation](https://learn.microsoft.com/graph/reportroot-authorization), "Global Reader and Usage Summary Reports Reader roles will only have access to tenant-level data, without visibility into detailed metrics." The newer `/copilot/reports/` endpoint variants don't accept these roles at all. **If you hold only one of these, the per-user call returns `403 Forbidden`** — add **Reports Reader** in addition.
+
+Role equivalents are treated as the same permission in the script. For example, Global Administrator and Company Administrator are equivalent, as are Teams Administrator and Teams Service Administrator, and Skype for Business Administrator and Lync Administrator. No combination of the tenant-only roles (Global Reader and Usage Summary Reports Reader) unlocks per-user detail.
 
 On every run, the script performs a directory-role pre-flight check using `/me/transitiveMemberOf` (which catches PIM activations and group-based assignments) and prints a clear `WARN` if the signed-in account holds only a tenant-only role or no qualifying role at all. The script still continues — a custom role may grant equivalent access — but the per-user call will likely return `403 Forbidden`. Pass `-SkipRoleCheck` to suppress the warning, or assign **Reports Reader** in the Microsoft Entra admin center and re-run.
 
@@ -53,7 +55,7 @@ On every run, the script performs a directory-role pre-flight check using `/me/t
 pwsh ./Get-Agent365ActiveUsers.ps1
 ```
 
-You will be prompted to sign in to Microsoft Graph. The script tries an interactive browser sign-in by default and **automatically falls back to device code authentication** in environments where a browser cannot be launched (SSH sessions, GitHub Codespaces, dev containers, headless Linux). Use `-UseDeviceCode` to force device code mode. When the run completes, the HTML report path and log path are printed to the console.
+You will be prompted to sign in to Microsoft Graph. The script tries an interactive browser sign-in by default and **automatically falls back to device code authentication** in environments where a browser cannot be launched (SSH sessions, GitHub Codespaces, dev containers, headless Linux). The Unified Audit Log step runs in a separate `pwsh` process on Windows so `Search-UnifiedAuditLog` is available without colliding with the Graph session. Use `-UseDeviceCode` to force device code mode for both Graph and Unified Audit Log auth. When the run completes, the HTML report path and log path are printed to the console.
 
 ### Device code sign-in tips
 
@@ -72,14 +74,16 @@ If a code does time out, the script automatically requests up to **3 fresh codes
 | `-Period` | `D30` | Reporting window: `D7`, `D30`, `D90`, `D180`, or `ALL`. |
 | `-CopilotSkuPartNumbers` | `MICROSOFT_365_COPILOT`, `E7` | Exact SKU part numbers treated as Agent 365 licenses. |
 | `-CopilotSkuPartNumberPatterns` | `*MICROSOFT_365_COPILOT*`, `*E7*`, `*AGENT*`, `*COPILOT*` | Wildcard patterns also matched against subscribed SKU part numbers. |
-| `-IncludeUnifiedAuditLog` | _off_ | **Windows-only.** Also pull `CopilotInteraction` (or `-AuditOperations`) events from the Unified Audit Log and merge with Graph results. Auto-skipped with a warning on Linux/macOS. |
+| `-IncludeUnifiedAuditLog` | _off_ | **Windows-only.** Also pull `CopilotInteraction` (or `-AuditOperations`) events from the Unified Audit Log and merge with Graph results. Runs a separate `pwsh` process, checks the effective audit-log role assignment (including inherited equivalents like Global Administrator / Company Administrator, Audit Manager / Audit Reader, and Global Reader), and skips cleanly if `Search-UnifiedAuditLog` cannot be used. Auto-skipped with a warning on Linux/macOS. |
 | `-AuditOperations` | `CopilotInteraction` | Unified Audit Log operations used to identify active users (only applied when `-IncludeUnifiedAuditLog` is set). |
 | `-AuditResultSize` | `5000` | Max audit records returned per query (1–5000). |
 | `-ReportPath` | `./Agent365-ActiveUsers-Report.html` | Output path for the HTML report. |
 | `-LogPath` | `./Agent365-ActiveUsers.log` | Output path for the execution log (recreated on every run). |
 | `-NoProgress` | _off_ | Suppress progress bars. |
 | `-VerboseLog` | _off_ | Log per-user classification details to console and log. |
-| `-UseDeviceCode` | _off_ | Force device code sign-in. Auto-detected when no browser is available. |
+| `-UseDeviceCode` | _off_ | Force device code sign-in for both Graph and Unified Audit Log auth. Auto-detected when no browser is available. |
+| `-SignInAccount` | _(blank)_ | Optional UPN/login hint used across all auth paths (Graph + Unified Audit Log child session for Exchange Online and Security & Compliance) so multi-account environments can target a specific account. Omit this parameter (or pass `""`) to use the normal account picker flow on supported machines. |
+| `-PickSignInAccount` | _off_ | Explicitly force a fresh interactive sign-in when no `-SignInAccount` is provided (clears cached Graph session and prefers browser/account-picker flows for Graph and Unified Audit Log child auth). Falls back to device code only if interactive sign-in fails or `-UseDeviceCode` is also specified. |
 | `-SkipRoleCheck` | _off_ | Skip the Microsoft Entra directory-role pre-flight check (see [Required permissions](#required-permissions)). Use when access is granted via a custom role the check doesn't recognise. |
 | `-ReturnRaw` | _off_ | Emit a JSON object with summary + user lists + data-source metadata instead of writing the HTML report and tables. |
 
@@ -103,6 +107,18 @@ pwsh ./Get-Agent365ActiveUsers.ps1 -VerboseLog
 
 # Force device code sign-in (SSH, Codespaces, headless servers)
 pwsh ./Get-Agent365ActiveUsers.ps1 -UseDeviceCode
+
+# Target a specific account hint across Graph + UAL auth paths
+pwsh ./Get-Agent365ActiveUsers.ps1 -UseDeviceCode -SignInAccount admin@contoso.com
+
+# Use the same account hint across Graph + UAL auth paths
+pwsh ./Get-Agent365ActiveUsers.ps1 -SignInAccount admin@contoso.com
+
+# Use account picker behavior (no account hint)
+pwsh ./Get-Agent365ActiveUsers.ps1
+
+# Explicitly force account picker (without passing a UPN)
+pwsh ./Get-Agent365ActiveUsers.ps1 -PickSignInAccount
 
 # Override Agent 365 license matching
 pwsh ./Get-Agent365ActiveUsers.ps1 `
@@ -139,7 +155,7 @@ Both files are ignored by `.gitignore` and never committed. The log and HTML rep
 - Microsoft Graph usage reports typically have a 24–48 hour reporting latency.
 - The `getMicrosoft365CopilotUsageUserDetail` endpoint reports users with assigned Microsoft 365 Copilot / Agent 365 licenses. Unlicensed Copilot Chat activity is only visible when you also enable `-IncludeUnifiedAuditLog` on Windows.
 - The per-user detail report has stricter access requirements than the summary tiles. The signed-in account needs **Reports Reader** (least privilege) or a higher Microsoft Entra admin role such as Global Administrator, AI Administrator, or one of the Exchange / SharePoint / Teams / Lync admin roles — `Reports.Read.All` Graph scope alone is not sufficient. The summary tiles use less restrictive permissions, so they may succeed even when user-detail returns `403 Forbidden`.
-- The Unified Audit Log step requires `Search-UnifiedAuditLog` from the Exchange Online PowerShell module, which is **Windows-only** in PowerShell 7. The script auto-skips this step with a warning on Linux/macOS instead of failing.
+- The Unified Audit Log step requires `Search-UnifiedAuditLog` from the Exchange Online PowerShell module, which is **Windows-only** in PowerShell 7. The script checks effective audit-log permissions before querying, including inherited equivalents such as Global Admin via Organization Management and Global Reader via View-Only Audit Logs. It auto-skips this step with a warning on Linux/macOS instead of failing.
 
 ## Development
 
