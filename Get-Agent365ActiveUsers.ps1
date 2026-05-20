@@ -38,7 +38,16 @@ param(
     # Windows PowerShell 7. When this switch is off (default), the script
     # builds the active-user list from Microsoft Graph alone, which works on
     # Linux/macOS as well as Windows.
-    [switch]$IncludeUnifiedAuditLog
+    [switch]$IncludeUnifiedAuditLog,
+
+    # Skip the pre-flight Microsoft Entra directory-role check. By default
+    # the script enumerates the signed-in account's directory roles via
+    # /me/transitiveMemberOf and warns when none of the qualifying roles
+    # for getMicrosoft365CopilotUsageUserDetail are present. Use this
+    # switch if the role lookup itself fails (e.g. missing scope) or if
+    # access is granted via a custom directory role the check does not
+    # recognise.
+    [switch]$SkipRoleCheck
 )
 
 Set-StrictMode -Version Latest
@@ -48,6 +57,13 @@ $script:StepId = 1
 $script:TotalSteps = 9
 $script:ScriptVersion = '1.0.0'
 $script:LogFullPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $LogPath))
+
+# Set by the directory-role pre-check (see Test-Agent365ReportsAccess) when
+# the signed-in account is known to lack a role that qualifies for the
+# per-user Copilot usage report. The main flow uses this to skip the
+# user-detail call and degrade gracefully to a summary-only report.
+$script:userDetailLikelyForbidden = $false
+$script:userDetailSkipReason      = $null
 
 function Write-Log {
     param(
@@ -248,6 +264,149 @@ function Get-TenantContextInfo {
     return $info
 }
 
+function Test-Agent365ReportsAccess {
+    <#
+    .SYNOPSIS
+        Checks whether the signed-in account holds a Microsoft Entra admin
+        role that qualifies for the per-user Microsoft 365 Copilot usage
+        report (getMicrosoft365CopilotUsageUserDetail).
+
+    .DESCRIPTION
+        Reports.Read.All Graph scope alone is NOT sufficient for the
+        per-user Copilot usage report. The signed-in account must also
+        hold one of the qualifying directory roles documented at:
+          https://learn.microsoft.com/graph/reportroot-authorization
+          https://learn.microsoft.com/microsoft-365/copilot/extensibility/api/admin-settings/reports/copilotreportroot-getmicrosoft365copilotusageuserdetail
+
+        Roles split into two tiers:
+
+        * FullAccess: returns per-user detail (this script needs this).
+          Global Admin, AI Admin, Reports Reader, Exchange / SharePoint /
+          Teams Service / Teams Communications / Skype (Lync) Admin.
+
+        * TenantOnly: documented as authorized for the report but
+          Microsoft restricts these roles to "tenant-level data, without
+          visibility into detailed metrics". The per-user call may
+          return 403 or empty per-user records depending on which Graph
+          endpoint variant is hit. Global Reader and Usage Summary
+          Reports Reader are in this tier.
+
+        This function enumerates the signed-in user's transitive directory
+        roles (so PIM and group-based assignments are caught) and matches
+        them against both tiers by roleTemplateId (stable) and displayName
+        (readable).
+
+        Returns a [pscustomobject] with HasQualifyingRole (= FullAccess),
+        HasTenantOnlyRole, AssignedRoles, FullAccessRoles, TenantOnlyRoles,
+        and a Checked flag (false if the lookup itself failed). The caller
+        decides how to warn.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # Microsoft Entra admin roles that grant FULL access to the per-user
+    # Microsoft 365 Copilot usage report (including detailed per-user
+    # records). roleTemplateId is the stable identifier; displayName is
+    # the human-readable name (may differ slightly across tenants).
+    $fullAccessRoles = @(
+        [pscustomobject]@{ DisplayName = 'Global Administrator';              TemplateId = '62e90394-69f5-4237-9190-012177145e10' }
+        [pscustomobject]@{ DisplayName = 'Company Administrator';             TemplateId = '62e90394-69f5-4237-9190-012177145e10' }
+        [pscustomobject]@{ DisplayName = 'AI Administrator';                  TemplateId = 'd2562ede-74db-457e-a7b6-544e236ebb61' }
+        [pscustomobject]@{ DisplayName = 'Reports Reader';                    TemplateId = '4a5d8f65-41da-4de4-8968-e035b65339cf' }
+        [pscustomobject]@{ DisplayName = 'Exchange Administrator';            TemplateId = '29232cdf-9323-42fd-ade2-1d097af3e4de' }
+        [pscustomobject]@{ DisplayName = 'SharePoint Administrator';          TemplateId = 'f28a1f50-f6e7-4571-818b-6a12f2af6b6c' }
+        [pscustomobject]@{ DisplayName = 'Teams Administrator';               TemplateId = '69091246-20e8-4a56-aa4d-066075b2a7a8' }
+        [pscustomobject]@{ DisplayName = 'Teams Service Administrator';       TemplateId = '69091246-20e8-4a56-aa4d-066075b2a7a8' }
+        [pscustomobject]@{ DisplayName = 'Teams Communications Administrator';TemplateId = 'baf37b3a-610e-45da-9e62-d9d1e5e8914b' }
+        [pscustomobject]@{ DisplayName = 'Skype for Business Administrator';  TemplateId = '75941009-915a-4869-abe7-691bff18279e' }
+        [pscustomobject]@{ DisplayName = 'Lync Administrator';                TemplateId = '75941009-915a-4869-abe7-691bff18279e' }
+    )
+
+    # Roles documented as authorized but restricted to TENANT-LEVEL data
+    # only. The per-user detail report will either return 403 or omit
+    # per-user records when only one of these is held.
+    $tenantOnlyRoles = @(
+        [pscustomobject]@{ DisplayName = 'Global Reader';                  TemplateId = 'f2ef992c-3afb-46b9-b7cf-a126ee74c451' }
+        [pscustomobject]@{ DisplayName = 'Usage Summary Reports Reader';   TemplateId = '75934031-6c7e-415a-99d7-48dbd49e875e' }
+    )
+
+    $result = [pscustomobject]@{
+        Checked            = $false
+        HasQualifyingRole  = $false
+        HasTenantOnlyRole  = $false
+        UserPrincipalName  = $null
+        AssignedRoles      = @()
+        FullAccessRoles    = @()
+        TenantOnlyRoles    = @()
+        QualifyingRoleList = @($fullAccessRoles | Select-Object -ExpandProperty DisplayName -Unique)
+        TenantOnlyRoleList = @($tenantOnlyRoles | Select-Object -ExpandProperty DisplayName -Unique)
+    }
+
+    # Pull /me first so we can log who we checked even if the role pull fails.
+    try {
+        $me = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=userPrincipalName,displayName,id'
+        if ($me -and $me.userPrincipalName) {
+            $result.UserPrincipalName = [string]$me.userPrincipalName
+        }
+    } catch {
+        Write-VerboseLog -Message "/me lookup failed during role check: $($_.Exception.Message)"
+    }
+
+    # transitiveMemberOf catches PIM activations and nested group-based
+    # role assignments; memberOf would miss those. Filter server-side to
+    # directoryRole entities to minimise payload.
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?$select=id,displayName,roleTemplateId&$top=200'
+    } catch {
+        Write-VerboseLog -Message "transitiveMemberOf lookup failed during role check: $($_.Exception.Message)"
+        return $result
+    }
+
+    $result.Checked = $true
+
+    $roles = @()
+    if ($resp -and $resp.value) { $roles = @($resp.value) }
+
+    $assignedTemplateIds = @($roles | ForEach-Object { $_.roleTemplateId } | Where-Object { $_ })
+    $assignedDisplay     = @($roles | ForEach-Object { $_.displayName }    | Where-Object { $_ })
+    # Wrap Sort-Object -Unique in @(...) -- on empty/single input it returns
+    # $null or a scalar, which would break .Count access under StrictMode.
+    $result.AssignedRoles = @($assignedDisplay | Sort-Object -Unique)
+
+    # Helper: project assigned roles back to canonical display names for
+    # a given tier definition, matching by either roleTemplateId or
+    # displayName.
+    $projectMatches = {
+        param($tierDefs, $assignedIds, $assignedNames)
+
+        $tierTemplateIds  = @($tierDefs | Select-Object -ExpandProperty TemplateId  -Unique)
+        $tierDisplayNames = @($tierDefs | Select-Object -ExpandProperty DisplayName -Unique)
+
+        $matchedTemplateIds = @($assignedIds   | Where-Object { $tierTemplateIds  -contains $_ })
+        $matchedDisplayHits = @($assignedNames | Where-Object { $tierDisplayNames -contains $_ })
+
+        $matched = @()
+        foreach ($tid in ($matchedTemplateIds | Sort-Object -Unique)) {
+            $name = ($tierDefs | Where-Object { $_.TemplateId -eq $tid } | Select-Object -First 1).DisplayName
+            if ($name) { $matched += $name }
+        }
+        foreach ($name in $matchedDisplayHits) {
+            if ($matched -notcontains $name) { $matched += $name }
+        }
+        return @($matched | Sort-Object -Unique)
+    }
+
+    # Wrap scriptblock invocations in @(...) -- PowerShell unwraps an empty
+    # array returned via the call operator (&) back to $null, which would
+    # then fail .Count access under StrictMode.
+    $result.FullAccessRoles   = @(& $projectMatches $fullAccessRoles $assignedTemplateIds $assignedDisplay)
+    $result.TenantOnlyRoles   = @(& $projectMatches $tenantOnlyRoles $assignedTemplateIds $assignedDisplay)
+    $result.HasQualifyingRole = ($result.FullAccessRoles.Count -gt 0)
+    $result.HasTenantOnlyRole = ($result.TenantOnlyRoles.Count -gt 0)
+
+    return $result
+}
+
 function Test-CanLaunchBrowser {
     [CmdletBinding()]
     param()
@@ -304,6 +463,12 @@ function Invoke-DeviceCodeMgGraphSignIn {
     $canPrompt = Test-CanPromptOnStdin
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        # On a retry, clear any stale Graph session so the next device code
+        # doesn't collide with a half-cached identity from the previous attempt.
+        if ($attempt -gt 1) {
+            try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose "Disconnect-MgGraph cleanup ignored: $($_.Exception.Message)" }
+        }
+
         Write-Host ''
         Write-Host '=== Microsoft Graph sign-in (device code) ==='
         Write-Host ''
@@ -325,6 +490,21 @@ function Invoke-DeviceCodeMgGraphSignIn {
             return
         } catch {
             $message = $_.Exception.Message
+
+            # MSAL sometimes reports "timed out due to inactivity" even after the
+            # user's browser-side sign-in succeeded. Re-check Get-MgContext: if a
+            # valid context with all required scopes is now present, treat the
+            # call as successful instead of forcing another device code.
+            $ctxAfter = $null
+            try { $ctxAfter = Get-MgContext } catch { $ctxAfter = $null }
+            if ($ctxAfter -and $ctxAfter.Account) {
+                $missingScopes = @($Scopes | Where-Object { $ctxAfter.Scopes -notcontains $_ })
+                if ($missingScopes.Count -eq 0) {
+                    Write-Log -Message ("Microsoft Graph sign-in raised '{0}' but an authenticated context with all required scopes is present (account: {1}). Continuing." -f $message, $ctxAfter.Account)
+                    return
+                }
+            }
+
             $isTransient = ($message -match 'timed out|authorization_pending|expired_token|inactivity')
             if ($attempt -lt $MaxAttempts -and $isTransient) {
                 Write-Log -Level 'WARN' -Message ("Microsoft Graph sign-in attempt {0} failed: {1}. Retrying with a fresh device code." -f $attempt, $message)
@@ -406,6 +586,12 @@ function Invoke-DeviceCodeExoSignIn {
     $canPrompt = Test-CanPromptOnStdin
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        # On a retry, clear any half-established EXO session to avoid the next
+        # device code colliding with a stale connection.
+        if ($attempt -gt 1) {
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose "Disconnect-ExchangeOnline cleanup ignored: $($_.Exception.Message)" }
+        }
+
         Write-Host ''
         Write-Host '=== Exchange Online sign-in (device code) ==='
         Write-Host ''
@@ -427,6 +613,17 @@ function Invoke-DeviceCodeExoSignIn {
             return
         } catch {
             $message = $_.Exception.Message
+
+            # Exchange Online's auth flow can throw a timeout even after the
+            # browser-side sign-in succeeded. Check Get-ConnectionInformation:
+            # if an active connection exists, treat this as success.
+            $existingConnection = $null
+            try { $existingConnection = Get-ConnectionInformation -ErrorAction Stop | Where-Object { $_.State -eq 'Connected' } | Select-Object -First 1 } catch { $existingConnection = $null }
+            if ($existingConnection) {
+                Write-Log -Message ("Exchange Online sign-in raised '{0}' but an active connection is present (account: {1}). Continuing." -f $message, $existingConnection.UserPrincipalName)
+                return
+            }
+
             $isTransient = ($message -match 'timed out|authorization_pending|expired_token|inactivity')
             if ($attempt -lt $MaxAttempts -and $isTransient) {
                 Write-Log -Level 'WARN' -Message ("Exchange Online sign-in attempt {0} failed: {1}. Retrying with a fresh device code." -f $attempt, $message)
@@ -663,76 +860,135 @@ function Get-CopilotUserDetail {
         [string]$Period
     )
 
-    # The Microsoft 365 Copilot user-detail report lives under /reports (not
-    # /copilot/reports) and supports the same JSON/CSV format switching as the
-    # summary report. We prefer JSON for the inline+paginated shape and fall
-    # back to CSV (delivered via a 302 to a download URL) when JSON is refused.
-    $base = "https://graph.microsoft.com/v1.0/reports/getMicrosoft365CopilotUsageUserDetail(period='$Period')"
-
-    $jsonUris = @(
-        "$base`?`$format=application/json",
-        "$base`?`$format=json",
-        $base
+    # The Microsoft 365 Copilot user-detail report is published on the beta
+    # surface in two parallel namespaces:
+    #   1. /beta/reports/...                (reportRoot, original publication)
+    #   2. /beta/copilot/reports/...        (copilotReportRoot, newer)
+    # Tenants vary in which one is reachable, so we try both before giving up.
+    # Both expose the same JSON/CSV format switching used by the summary report.
+    $bases = @(
+        "https://graph.microsoft.com/beta/reports/getMicrosoft365CopilotUsageUserDetail(period='$Period')",
+        "https://graph.microsoft.com/beta/copilot/reports/getMicrosoft365CopilotUsageUserDetail(period='$Period')"
     )
 
-    foreach ($u in $jsonUris) {
-        try {
-            Write-VerboseLog -Message "Trying Copilot user-detail URI: $u"
-            $records = New-Object System.Collections.Generic.List[object]
-            $next = $u
-            $page = 0
-            while ($next) {
-                $page++
-                $resp = Invoke-MgGraphRequest -Method GET -Uri $next
-                if ($resp -is [string]) {
-                    # JSON path returned raw text - probably CSV. Parse it and stop paging.
-                    $parsed = ConvertFrom-CopilotUserDetailCsv -CsvText $resp
-                    foreach ($p in @($parsed)) { $records.Add($p) }
+    $attemptErrors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($base in $bases) {
+        $jsonUris = @(
+            "$base`?`$format=application/json",
+            "$base`?`$format=json",
+            $base
+        )
+
+        foreach ($u in $jsonUris) {
+            try {
+                Write-VerboseLog -Message "Trying Copilot user-detail URI: $u"
+                $records = New-Object System.Collections.Generic.List[object]
+                $next = $u
+                $page = 0
+                while ($next) {
+                    $page++
+                    $resp = Invoke-MgGraphRequest -Method GET -Uri $next
+                    if ($resp -is [string]) {
+                        # JSON path returned raw text - probably CSV. Parse it and stop paging.
+                        $parsed = ConvertFrom-CopilotUserDetailCsv -CsvText $resp
+                        foreach ($p in @($parsed)) { $records.Add($p) }
+                        $next = $null
+                        break
+                    }
+                    if ($resp -and $resp.value) {
+                        foreach ($v in @($resp.value)) { $records.Add($v) }
+                    }
                     $next = $null
-                    break
+                    if ($resp -and $resp.'@odata.nextLink') {
+                        $next = [string]$resp.'@odata.nextLink'
+                        Write-VerboseLog -Message "Following nextLink (page $page)"
+                    }
                 }
-                if ($resp -and $resp.value) {
-                    foreach ($v in @($resp.value)) { $records.Add($v) }
+                if ($records.Count -gt 0) {
+                    Write-VerboseLog -Message "Copilot user-detail rows retrieved (JSON path): $($records.Count)"
+                    return $records.ToArray()
                 }
-                $next = $null
-                if ($resp -and $resp.'@odata.nextLink') {
-                    $next = [string]$resp.'@odata.nextLink'
-                    Write-VerboseLog -Message "Following nextLink (page $page)"
+            } catch {
+                $detail = $_.Exception.Message
+                if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                    $detail = "$detail | body: $($_.ErrorDetails.Message)"
                 }
+                Write-VerboseLog -Message "Copilot user-detail attempt failed for '$u': $detail"
+                $attemptErrors.Add("GET $u -> $detail")
             }
-            if ($records.Count -gt 0) {
-                Write-VerboseLog -Message "Copilot user-detail rows retrieved (JSON path): $($records.Count)"
-                return $records.ToArray()
+        }
+
+        # CSV fallback via temp file (mirrors Get-CopilotSummaryMetrics).
+        $tmpCsv = $null
+        $csvUri = "$base`?`$format=text/csv"
+        try {
+            $tmpCsv = [System.IO.Path]::Combine(
+                [System.IO.Path]::GetTempPath(),
+                "copilot-user-detail-$([guid]::NewGuid()).csv"
+            )
+            Write-VerboseLog -Message "Trying user-detail CSV via temp file: $csvUri -> $tmpCsv"
+            Invoke-MgGraphRequest -Method GET -Uri $csvUri -OutputFilePath $tmpCsv | Out-Null
+            if (-not (Test-Path -LiteralPath $tmpCsv)) {
+                throw "Graph did not write any CSV output to '$tmpCsv'."
             }
+            $csvText = Get-Content -LiteralPath $tmpCsv -Raw
+            $records = ConvertFrom-CopilotUserDetailCsv -CsvText $csvText
+            Write-VerboseLog -Message "Copilot user-detail rows retrieved (CSV path): $($records.Count)"
+            return @($records)
         } catch {
-            Write-VerboseLog -Message "Copilot user-detail attempt failed for '$u': $($_.Exception.Message)"
+            $detail = $_.Exception.Message
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $detail = "$detail | body: $($_.ErrorDetails.Message)"
+            }
+            Write-VerboseLog -Message "Copilot user-detail CSV attempt failed for '$csvUri': $detail"
+            $attemptErrors.Add("GET $csvUri -> $detail")
+        } finally {
+            if ($tmpCsv -and (Test-Path -LiteralPath $tmpCsv)) {
+                Remove-Item -LiteralPath $tmpCsv -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
-    # CSV fallback via temp file (mirrors Get-CopilotSummaryMetrics).
-    $tmpCsv = $null
-    try {
-        $csvUri = "$base`?`$format=text/csv"
-        $tmpCsv = [System.IO.Path]::Combine(
-            [System.IO.Path]::GetTempPath(),
-            "copilot-user-detail-$([guid]::NewGuid()).csv"
-        )
-        Write-VerboseLog -Message "Falling back to user-detail CSV via temp file: $csvUri -> $tmpCsv"
-        Invoke-MgGraphRequest -Method GET -Uri $csvUri -OutputFilePath $tmpCsv | Out-Null
-        if (-not (Test-Path -LiteralPath $tmpCsv)) {
-            throw "Graph did not write any CSV output to '$tmpCsv'."
-        }
-        $csvText = Get-Content -LiteralPath $tmpCsv -Raw
-        $records = ConvertFrom-CopilotUserDetailCsv -CsvText $csvText
-        Write-VerboseLog -Message "Copilot user-detail rows retrieved (CSV path): $($records.Count)"
-        return @($records)
-    } catch {
-        throw "Failed to retrieve Copilot user detail from Graph. Last error: $($_.Exception.Message)"
-    } finally {
-        if ($tmpCsv -and (Test-Path -LiteralPath $tmpCsv)) {
-            Remove-Item -LiteralPath $tmpCsv -Force -ErrorAction SilentlyContinue
-        }
+    # Every attempt failed. Build a comprehensive error message with hints.
+    $allErrors = ($attemptErrors -join "`n  - ")
+    $hint = ''
+    if ($allErrors -match 'Forbidden|\b403\b') {
+        $hint = @'
+
+This is almost certainly a permissions issue. The Microsoft 365 Copilot
+user-detail report requires the signed-in account to hold one of these
+Microsoft Entra admin roles in addition to the Reports.Read.All Graph scope:
+  - Global Administrator (Company Administrator)
+  - AI Administrator
+  - Reports Reader  (least-privilege option)
+  - Exchange / SharePoint / Teams Service / Teams Communications Admin
+  - Lync Administrator
+
+Holding only Global Reader, Usage Summary Reports Reader, or a non-admin
+account is NOT sufficient for the per-user detail report (the summary report
+has lower requirements, which is why it succeeded earlier in this run).
+
+Assign Reports Reader (or a higher admin role) to your sign-in account,
+then run Disconnect-MgGraph and re-run this script to refresh the token.
+'@
+    } elseif ($allErrors -match 'BadRequest|\b400\b') {
+        $hint = @'
+
+400 BadRequest from every attempt usually means the report endpoint is not
+exposed on this tenant's API surface. Verify Microsoft 365 Copilot is
+enabled for the tenant and that you signed in to the correct tenant.
+'@
+    } elseif ($allErrors -match 'NotFound|\b404\b') {
+        $hint = @'
+
+404 NotFound from every attempt means the report function does not exist on
+this tenant's API surface. The endpoint may have been renamed or the
+Microsoft 365 Copilot service is not provisioned in this tenant.
+'@
     }
+
+    throw "Failed to retrieve Copilot user detail from Graph after $($attemptErrors.Count) attempt(s).`nAttempts:`n  - $allErrors$hint"
 }
 
 function ConvertTo-Agent365ActiveUserCandidate {
@@ -1035,6 +1291,27 @@ function New-Agent365HtmlReport {
     $accountHtml       = & $encode $TenantInfo.Account       'Unknown'
     $scriptVersionHtml = & $encode $TenantInfo.ScriptVersion '0.0.0'
 
+    # Build an in-report warning banner when the per-user Graph call was
+    # skipped or returned 403 Forbidden. Without this the user might not
+    # realise the empty Licensed/Unlicensed tables are due to permissions
+    # rather than zero activity.
+    $userDetailBannerHtml = ''
+    if ($DataSources.PSObject.Properties.Name -contains 'GraphUserDetailUnavailable' -and $DataSources.GraphUserDetailUnavailable) {
+        $reasonHtml = & $encode $DataSources.GraphUserDetailReason 'The per-user Copilot detail call returned 403 Forbidden.'
+        $userDetailBannerHtml = @"
+            <div class="alert warning" role="alert">
+                <h3>Per-user Copilot activity unavailable</h3>
+                <p>$reasonHtml</p>
+                <p>This report shows tenant-level summary metrics only. The <strong>Licensed</strong> and <strong>Unlicensed</strong> active-user tables are empty because Microsoft Graph did not return per-user records for this account.</p>
+                <p><strong>To populate the per-user tables:</strong></p>
+                <ul>
+                    <li>Assign <code>Reports Reader</code> (least privilege, read-only) or a higher admin role (Global Admin, AI Admin, Exchange / SharePoint / Teams admin) to the signed-in account in the Microsoft Entra admin center.</li>
+                    <li>Run <code>Disconnect-MgGraph</code> and re-run this script to refresh the token.</li>
+                </ul>
+            </div>
+"@
+    }
+
     $html = @"
 <!doctype html>
 <html lang="en">
@@ -1083,6 +1360,11 @@ function New-Agent365HtmlReport {
         .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; box-shadow: 0 8px 24px rgba(14, 28, 45, 0.06); }
         h1 { margin: 0 0 12px 0; font-size: 28px; }
         .meta { color: var(--muted); margin-bottom: 16px; font-size: 13px; }
+        .alert { border-radius: 10px; padding: 12px 16px; margin: 0 0 16px 0; border: 1px solid; }
+        .alert.warning { background: #fff8e1; border-color: #f0c97a; color: #6b4f00; }
+        .alert h3 { margin: 0 0 6px 0; font-size: 15px; }
+        .alert p { margin: 0 0 6px 0; }
+        .alert ul { margin: 6px 0 0 18px; padding: 0; }
         .notes { border: 1px solid var(--line); background: #f9fbfe; border-radius: 10px; padding: 12px 14px; margin-top: 16px; }
         .notes h2 { margin: 0 0 8px 0; font-size: 16px; }
         .notes ul { margin: 0; padding-left: 20px; color: var(--muted); }
@@ -1151,6 +1433,7 @@ function New-Agent365HtmlReport {
         <div class="panel">
             <h1>Agent 365 Active Users Report</h1>
             <div class="meta">Generated UTC: $generatedUtc &middot; Period: $($Summary.Period) &middot; Report Refresh Date: $($Summary.ReportRefreshDate)</div>
+$userDetailBannerHtml
             <div class="stats">
                 <div class="stat"><div class="k">Agent 365 Active Users</div><div class="v">$($Summary.ActiveUsers)</div></div>
                 <div class="stat"><div class="k">Enabled Users</div><div class="v">$($Summary.EnabledUsers)</div></div>
@@ -1303,6 +1586,59 @@ $script:StepId++
 Write-Log -Message 'Resolving tenant context for report header.'
 $tenantInfo = Get-TenantContextInfo
 
+# Pre-flight: confirm the signed-in account holds a directory role that
+# qualifies for the per-user Copilot usage report. Reports.Read.All Graph
+# scope alone is not enough -- the user-detail endpoint also requires one
+# of: Global Administrator, AI Administrator, Reports Reader (least
+# privilege), Exchange / SharePoint / Teams Service / Teams Communications
+# / Skype for Business (Lync) Administrator. This is a WARN-only check
+# (custom roles may grant access via different mechanisms), but it gives
+# the user immediate, actionable guidance instead of waiting for a 403.
+if ($SkipRoleCheck) {
+    Write-Log -Message 'Skipping Microsoft Entra directory-role pre-check (-SkipRoleCheck specified).'
+} else {
+    Write-Log -Message 'Checking signed-in account for a directory role that qualifies for the per-user Copilot usage report.'
+    $roleCheck = Test-Agent365ReportsAccess
+    if (-not $roleCheck.Checked) {
+        Write-Log -Level 'WARN' -Message ('Could not enumerate directory roles for the signed-in account ({0}). Skipping role pre-check; the per-user Copilot report call may fail with 403 Forbidden.' -f ($roleCheck.UserPrincipalName ?? '<unknown>'))
+    } elseif ($roleCheck.HasQualifyingRole) {
+        Write-Log -Message ('Directory-role pre-check passed for {0}. Full-access roles assigned: {1}.' -f ($roleCheck.UserPrincipalName ?? '<unknown>'), ($roleCheck.FullAccessRoles -join ', '))
+        if ($roleCheck.HasTenantOnlyRole) {
+            Write-Log -Message ('  Additionally holds tenant-only role(s): {0} (not needed; full-access role takes precedence).' -f ($roleCheck.TenantOnlyRoles -join ', '))
+        }
+    } elseif ($roleCheck.HasTenantOnlyRole) {
+        # Role IS documented as authorized, but per
+        # https://learn.microsoft.com/graph/reportroot-authorization
+        # "Global Reader and Usage Summary Reports Reader roles will only
+        # have access to tenant-level data, without visibility into
+        # detailed metrics." Newer /copilot/reports/ variants do not
+        # include these roles at all.
+        $upn = $roleCheck.UserPrincipalName
+        if (-not $upn) { $upn = '<unknown>' }
+        Write-Log -Level 'WARN' -Message ('Directory-role pre-check: account {0} holds {1}, which is documented as TENANT-LEVEL ONLY for the Copilot usage report.' -f $upn, ($roleCheck.TenantOnlyRoles -join ', '))
+        Write-Log -Level 'WARN' -Message '  Microsoft restricts these roles to aggregate data only; per-user records are not returned and the call typically yields 403 Forbidden on /beta/reports and /copilot/reports endpoints.'
+        Write-Log -Level 'WARN' -Message ("  Required for per-user detail (any one of): $($roleCheck.QualifyingRoleList -join ', ')")
+        Write-Log -Level 'WARN' -Message '  Remediation: in the Microsoft Entra admin center, assign Reports Reader (least privilege, read-only) IN ADDITION to your current role, then run: Disconnect-MgGraph; and re-run this script.'
+        Write-Log -Level 'WARN' -Message '  Skipping per-user detail call. The report will still be generated from Graph summary metrics + license data; the Licensed/Unlicensed active-user tables will be empty.'
+        $script:userDetailLikelyForbidden = $true
+        $script:userDetailSkipReason = ('Signed-in account ({0}) holds only tenant-level role(s): {1}. Microsoft restricts these roles to aggregate data only.' -f $upn, ($roleCheck.TenantOnlyRoles -join ', '))
+    } else {
+        $upn = $roleCheck.UserPrincipalName
+        if (-not $upn) { $upn = '<unknown>' }
+        $assignedText = if (@($roleCheck.AssignedRoles).Count -gt 0) { $roleCheck.AssignedRoles -join ', ' } else { '<none>' }
+        Write-Log -Level 'WARN' -Message ('Directory-role pre-check FAILED. Signed-in account {0} does not hold any role that qualifies for getMicrosoft365CopilotUsageUserDetail.' -f $upn)
+        Write-Log -Level 'WARN' -Message ("  Assigned directory roles: $assignedText")
+        Write-Log -Level 'WARN' -Message ("  Required (any one of): $($roleCheck.QualifyingRoleList -join ', ')")
+        Write-Log -Level 'WARN' -Message ("  Documented but tenant-only (insufficient for per-user detail): $($roleCheck.TenantOnlyRoleList -join ', ')")
+        Write-Log -Level 'WARN' -Message '  Reports.Read.All Graph scope alone is NOT sufficient. The per-user Copilot report will likely return 403 Forbidden.'
+        Write-Log -Level 'WARN' -Message '  Remediation: in the Microsoft Entra admin center, assign Reports Reader (least privilege) to this account, then run: Disconnect-MgGraph; and re-run this script.'
+        Write-Log -Level 'WARN' -Message '  Skipping per-user detail call. The report will still be generated from Graph summary metrics + license data; the Licensed/Unlicensed active-user tables will be empty.'
+        Write-Log -Level 'WARN' -Message '  If access is granted via a custom directory role the check does not recognise, re-run with -SkipRoleCheck to suppress this warning and attempt the call anyway.'
+        $script:userDetailLikelyForbidden = $true
+        $script:userDetailSkipReason = ('Signed-in account ({0}) holds no directory role that qualifies for the per-user Copilot usage report. Assigned roles: {1}.' -f $upn, $assignedText)
+    }
+}
+
 # Microsoft's /copilot/reports endpoints currently return a CSV-backed Stream.
 # Get-CopilotSummaryMetrics tries JSON-format variants first and falls back to CSV.
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Pulling summary metrics from Graph'
@@ -1334,11 +1670,44 @@ $result = [PSCustomObject]@{
 $script:StepId++
 
 Update-StepProgress -Activity 'Agent 365 report' -Status 'Collecting active users from Microsoft Graph'
-Write-Log -Message 'Pulling per-user activity from Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
 $days = Get-PeriodDays -PeriodValue $Period
-$userDetailRecords = Get-CopilotUserDetail -Period $Period
+
+# User-detail availability tracking. The role pre-check above may have
+# already set $script:userDetailLikelyForbidden when it knows the call will
+# fail. We still wrap the actual call in try/catch as a safety net for
+# custom-role tenants where the pre-check can't predict success.
+$userDetailRecords        = @()
+$userDetailUnavailable    = $false
+$userDetailFailureReason  = $null
+
+if ($script:userDetailLikelyForbidden) {
+    Write-Log -Level 'WARN' -Message 'Skipping per-user Copilot detail call (role pre-check predicted 403 Forbidden). Report will be built from Graph summary metrics and license data only.'
+    $userDetailUnavailable   = $true
+    $userDetailFailureReason = $script:userDetailSkipReason
+} else {
+    Write-Log -Message 'Pulling per-user activity from Microsoft Graph (getMicrosoft365CopilotUsageUserDetail).'
+    try {
+        $userDetailRecords = Get-CopilotUserDetail -Period $Period
+    } catch {
+        $msg = [string]$_.Exception.Message
+        if ($msg -match 'Forbidden|\b403\b|S2SUnauthorized') {
+            Write-Log -Level 'WARN' -Message 'Per-user Copilot detail returned 403 Forbidden despite role pre-check passing (or pre-check skipped). Continuing with Graph summary + license data only.'
+            Write-Log -Level 'WARN' -Message '  Assign Reports Reader (or higher admin role) to this account, then run Disconnect-MgGraph and re-run.'
+            $userDetailRecords       = @()
+            $userDetailUnavailable   = $true
+            $userDetailFailureReason = '403 Forbidden from Microsoft Graph getMicrosoft365CopilotUsageUserDetail. The signed-in account does not have sufficient permissions to read per-user Copilot activity.'
+        } else {
+            throw
+        }
+    }
+}
+
 $graphCandidates = ConvertTo-Agent365ActiveUserCandidate -UserDetailRecords $userDetailRecords
-Write-Log -Message "Graph reported $($graphCandidates.Count) users with activity in the last $days day(s)."
+if ($userDetailUnavailable) {
+    Write-Log -Level 'WARN' -Message 'No per-user Graph activity available; Licensed/Unlicensed active-user tables will be empty unless UAL is enabled.'
+} else {
+    Write-Log -Message "Graph reported $($graphCandidates.Count) users with activity in the last $days day(s)."
+}
 $script:StepId++
 
 $auditCandidates = @()
@@ -1392,15 +1761,17 @@ $ualNoteHtml = if ($IncludeUnifiedAuditLog -and $IsWindows) {
 }
 
 $dataSources = [PSCustomObject]@{
-    GraphUserDetail   = $true
-    GraphCandidates   = $graphCandidates.Count
-    UalRequested      = [bool]$IncludeUnifiedAuditLog
-    UalAttempted      = [bool]$ualAttempted
-    UalSkippedReason  = $ualSkippedReason
-    UalCandidates     = $auditCandidates.Count
-    MergedCandidates  = $mergedCandidates.Count
-    AuditOperations   = $AuditOperations
-    UalNoteHtml       = $ualNoteHtml
+    GraphUserDetail            = -not $userDetailUnavailable
+    GraphUserDetailUnavailable = [bool]$userDetailUnavailable
+    GraphUserDetailReason      = $userDetailFailureReason
+    GraphCandidates            = $graphCandidates.Count
+    UalRequested               = [bool]$IncludeUnifiedAuditLog
+    UalAttempted               = [bool]$ualAttempted
+    UalSkippedReason           = $ualSkippedReason
+    UalCandidates              = $auditCandidates.Count
+    MergedCandidates           = $mergedCandidates.Count
+    AuditOperations            = $AuditOperations
+    UalNoteHtml                = $ualNoteHtml
 }
 
 if ($ReturnRaw) {
@@ -1434,7 +1805,13 @@ Write-Host "Agent 365 SKU pattern matches configured: $($CopilotSkuPartNumberPat
 Write-Host "Agent 365 SKUs matched in tenant: $($matchedSkuPartNumbers -join ', ')"
 Write-Host "Active Licensed Users Total: $($licensedTableUsers.Count)"
 Write-Host "Active Unlicensed Users Total: $($unlicensedTableUsers.Count)"
-Write-Host "Graph user-detail rows: $($dataSources.GraphCandidates)"
+if ($dataSources.GraphUserDetailUnavailable) {
+    Write-Host "Graph user-detail rows: UNAVAILABLE (per-user call skipped or returned 403 Forbidden)"
+    Write-Host "  Reason: $($dataSources.GraphUserDetailReason)"
+    Write-Host "  Report still generated using Graph summary metrics + license data only."
+} else {
+    Write-Host "Graph user-detail rows: $($dataSources.GraphCandidates)"
+}
 if ($dataSources.UalRequested) {
     if ($dataSources.UalSkippedReason) {
         Write-Host "Unified Audit Log: skipped ($($dataSources.UalSkippedReason))"
